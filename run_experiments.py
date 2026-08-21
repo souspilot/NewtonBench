@@ -224,7 +224,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     start_time = time.time()
     
     max_retries = 3
-    judge_model_name = "gpt41"
+    judge_model_name = cli_args.model_name # HACK for API poor researchers :-(
     
     pool_args = [
         (i, cli_args.noise, cli_args.model_name, cli_args.module, cli_args.equation_difficulty, cli_args.model_system, law_version, trials_dir, max_retries, judge_model_name, cli_args.agent_backend)
