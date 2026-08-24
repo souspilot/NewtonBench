@@ -21,6 +21,12 @@ try:
 except Exception:
 	_WITH_CODE_ASSISTANCE = False
 
+try:
+    from planned_agent import conduct_planned_exploration
+    _WITH_PLANNED_AGENT = True
+except Exception:
+    _WITH_PLANNED_AGENT = False
+
 def format_chat_history(chat_history):
     """Format chat history as a readable log file."""
     lines = []
@@ -105,7 +111,17 @@ def run_trial(args):
                 'trial_id': trial_id,
                 'trial_dir': trial_dir
             }
-            if agent_backend == "code_assisted_agent" and _WITH_CODE_ASSISTANCE:
+            if agent_backend == "planned_agent" and _WITH_PLANNED_AGENT:
+                exploration_result = conduct_planned_exploration(
+                    module=module,
+                    model_name=model_name,
+                    noise_level=noise_level,
+                    difficulty=difficulty,
+                    system=system,
+                    law_version=law_version,
+                    trial_info=trial_info
+                )
+            elif agent_backend == "code_assisted_agent" and _WITH_CODE_ASSISTANCE:
                 exploration_result = conduct_code_assisted_exploration(
                     module=module,
                     model_name=model_name,
@@ -373,7 +389,7 @@ if __name__ == "__main__":
                       help="Model system selected to test the agent: vanilla_equation, simple_system, complex_system")
     parser.add_argument("-l", "--law_version", type=str, default="all",
                       help="Specific law version to use, 'all' for all versions, or None for random selection or a specific version (e.g. v0, v1, v2)")
-    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent"],
+    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
                       help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
     cli_args = parser.parse_args()
 

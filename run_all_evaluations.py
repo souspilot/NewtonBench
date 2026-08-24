@@ -176,7 +176,7 @@ def main():
                       help="Difficulty level of the equation: easy, medium, or hard.")
     parser.add_argument("-m", "--model_system", type=str, default="none", choices=["vanilla_equation", "simple_system", "complex_system", "none"],
                       help="Model system selected to test the agent: vanilla_equation, simple_system, complex_system")
-    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent"],
+    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
                       help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
     
     # Resume and control options
