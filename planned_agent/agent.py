@@ -63,6 +63,28 @@ controlled-variable strategy:
 
 Begin your analysis now."""
 
+DISCOVERY_TEMPLATE_COMPACT = """\
+{condensed_prompt}
+
+---
+
+The following preprocessed data was collected via controlled-variable
+sweeps.  The assisting equations have already been applied — each row
+shows the physics inputs and the computed target quantity.
+
+{data}
+
+---
+
+**Your task:**
+1. For each input variable, examine the rows where only that variable
+   changes and determine the functional dependence.
+2. Combine into one equation and estimate constants.
+3. You may run up to {remaining} more verification experiments.
+4. Submit with <final_law> when ready.
+
+Begin your analysis now."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors vanilla_agent logic)
@@ -99,6 +121,50 @@ def _extract_final_law(text: str, func_sig: str):
     if matches:
         return True, matches[-1].strip()
     return False, f"{func_sig} return float('nan')"
+
+
+def _condense_prompt(task_prompt: str, module) -> str:
+    """
+    Extract just the essential parts of the task prompt:
+    function signature, parameter description, and submission format.
+    Drops the long apparatus/system description to save tokens.
+    """
+    lines = []
+    lines.append("You are discovering a scientific law in a universe where physics may differ from ours.")
+    lines.append("")
+
+    # Include the function signature
+    if hasattr(module, 'FUNCTION_SIGNATURE'):
+        lines.append(f"Your discovered law must use this signature: {module.FUNCTION_SIGNATURE}")
+    if hasattr(module, 'PARAM_DESCRIPTION'):
+        lines.append(f"Parameter description: {module.PARAM_DESCRIPTION}")
+    lines.append("")
+
+    # Extract the <final_law> submission format from the prompt
+    import re
+    final_law_section = re.search(
+        r'(<final_law>.*?</final_law>)',
+        task_prompt,
+        re.DOTALL,
+    )
+    if final_law_section:
+        lines.append("Submit your answer using this format:")
+        lines.append(final_law_section.group(1))
+    else:
+        lines.append("Submit using <final_law>def discovered_law(...): return ...</final_law>")
+
+    # Extract run_experiment format if present
+    run_exp_section = re.search(
+        r'(<run_experiment>.*?</run_experiment>)',
+        task_prompt,
+        re.DOTALL,
+    )
+    if run_exp_section:
+        lines.append("")
+        lines.append("To run additional experiments use:")
+        lines.append(run_exp_section.group(1))
+
+    return "\n".join(lines)
 
 
 def _append_assistant(messages, response_text, reasoning):
@@ -167,23 +233,40 @@ def conduct_planned_exploration(
                     "Consider averaging or accounting for uncertainty."
                 )
 
-    data_str = planner.format_results_for_llm(plan, all_exps, all_results)
+    data_str = planner.format_results_for_llm(plan, all_exps, all_results, prompt=task_prompt)
     if noise_note:
         data_str += noise_note
 
     # ── Phase 3: LLM discovery ───────────────────────────────────────
     llm_turns = max(max_turns - 1, 3)
 
+    # Use compact template for systems with preprocessed data
+    lower_prompt = task_prompt.lower()
+    is_preprocessed = (
+        ("velocity" in lower_prompt)
+        or ("spectral_radiance" in lower_prompt)
+        or ("calorimeter" in lower_prompt)
+    )
+
+    if is_preprocessed:
+        # Build a condensed prompt: just the function signature, param
+        # description, and submission format — skip the long apparatus text
+        condensed = _condense_prompt(task_prompt, module)
+        user_content = DISCOVERY_TEMPLATE_COMPACT.format(
+            condensed_prompt=condensed,
+            data=data_str,
+            remaining=llm_turns,
+        )
+    else:
+        user_content = DISCOVERY_TEMPLATE.format(
+            task_prompt=task_prompt,
+            data=data_str,
+            remaining=llm_turns,
+        )
+
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": DISCOVERY_TEMPLATE.format(
-                task_prompt=task_prompt,
-                data=data_str,
-                remaining=llm_turns,
-            ),
-        },
+        {"role": "user", "content": user_content},
     ]
 
     total_tokens = 0

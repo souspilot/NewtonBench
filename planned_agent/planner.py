@@ -303,11 +303,119 @@ class ExperimentPlanner:
         )
 
     @staticmethod
+    def preprocess_results(
+        plan: ExperimentPlan,
+        experiments: List[Dict[str, Any]],
+        results: List[Any],
+        prompt: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert raw experimental results into reduced (inputs → target) rows.
+
+        For trajectory data: extract F = m*a from velocity differences.
+        For spectrometer: compute n = R / omega^3.
+        For calorimeter: compute n = (P / bandwidth) / omega^3.
+        For vanilla/generic: pass through as-is.
+
+        Returns a list of dicts, each with input variable names and "output".
+        """
+        lower = prompt.lower()
+        is_trajectory = ("position" in lower and "velocity" in lower) or "time_step" in lower
+        is_calorimeter = "calorimeter" in lower or "total_power" in lower
+        is_spectrometer = "spectral_radiance" in lower and not is_calorimeter
+
+        rows = []
+        sim_params = {"duration", "time_step", "initial_velocity", "num_points"}
+
+        for exp, res in zip(experiments, results):
+            if is_trajectory and isinstance(res, dict) and "velocity" in res:
+                # Extract acceleration from first two velocity readings
+                vels = res["velocity"]
+                dt = exp.get("time_step", 0.001)
+                if len(vels) >= 2:
+                    v0, v1 = vels[0], vels[1]
+                    if isinstance(v0, list):
+                        # 2D: compute magnitude of acceleration
+                        ax = (float(v1[0]) - float(v0[0])) / dt
+                        ay = (float(v1[1]) - float(v0[1])) / dt
+                        a_mag = math.sqrt(ax**2 + ay**2)
+                    else:
+                        a_mag = abs((float(v1) - float(v0)) / dt)
+                    # F = m * a (use mass2 as the test particle mass)
+                    m_test = exp.get("mass2", exp.get("m2", exp.get("mass_wire", 1.0)))
+                    force = m_test * a_mag
+                    row = {k: v for k, v in exp.items() if k not in sim_params}
+                    row["computed_force"] = force
+                    rows.append(row)
+                else:
+                    continue
+
+            elif is_spectrometer and isinstance(res, (int, float)):
+                omega = exp.get("probe_frequency", exp.get("omega", 1.0))
+                n = float(res) / (omega ** 3) if omega != 0 else 0.0
+                row = {k: v for k, v in exp.items() if k not in sim_params}
+                row["computed_n"] = n
+                rows.append(row)
+
+            elif is_calorimeter and isinstance(res, (int, float)):
+                bw = exp.get("bandwidth", 1.0)
+                omega = exp.get("center_frequency", exp.get("omega", 1.0))
+                R = float(res) / bw if bw != 0 else 0.0
+                n = R / (omega ** 3) if omega != 0 else 0.0
+                row = {k: v for k, v in exp.items() if k not in sim_params}
+                row.pop("bandwidth", None)
+                row["computed_n"] = n
+                rows.append(row)
+
+            else:
+                # Vanilla / generic: pass through
+                row = dict(exp)
+                row["output"] = res
+                rows.append(row)
+
+        return rows
+
+    @staticmethod
     def format_results_for_llm(
         plan: ExperimentPlan,
         experiments: List[Dict[str, Any]],
         results: List[Any],
+        prompt: str = "",
     ) -> str:
+        """
+        Format data for the LLM.  When a prompt is provided and the data
+        is from a trajectory / spectrometer / calorimeter system, the raw
+        results are preprocessed first so the LLM sees only the compact
+        reduced table.
+        """
+        lower = prompt.lower()
+        needs_preprocess = (
+            ("velocity" in lower)
+            or ("spectral_radiance" in lower)
+            or ("calorimeter" in lower)
+            or ("total_power" in lower)
+        )
+
+        if needs_preprocess and prompt:
+            rows = ExperimentPlanner.preprocess_results(
+                plan, experiments, results, prompt,
+            )
+            lines = ["=" * 60, "PREPROCESSED EXPERIMENTAL DATA", "=" * 60]
+            if plan.preprocessing_hint:
+                lines += ["", plan.preprocessing_hint, ""]
+            lines.append(
+                "The raw trajectory / measurement data has already been "
+                "preprocessed for you using the assisting equations. "
+                "Each row below shows the physics inputs and the computed "
+                "target quantity."
+            )
+            lines.append("")
+            lines.append("--- Reduced Data ---")
+            for i, row in enumerate(rows):
+                lines.append(f"Exp {i + 1}: {json.dumps(row, default=str)}")
+            return "\n".join(lines)
+
+        # Vanilla / generic: raw data is already compact
         lines = ["=" * 60, "COLLECTED EXPERIMENTAL DATA", "=" * 60]
         if plan.preprocessing_hint:
             lines += ["", plan.preprocessing_hint, ""]
