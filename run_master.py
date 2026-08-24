@@ -58,7 +58,7 @@ def build_commands(
     commands: List[List[str]] = []
     for model in models:
         for module in modules:
-            for backend in ["vanilla_agent", "code_assisted_agent"]:
+            for backend in ["vanilla_agent", "code_assisted_agent", "planned_agent"]:
                 cmd = [
                     "python",
                     "run_all_evaluations.py",
