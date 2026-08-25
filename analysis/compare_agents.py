@@ -70,20 +70,17 @@ def load_all_trials(base_dir: str, model: str) -> Dict:
         print(f"ERROR: {model_dir} not found")
         return trials
 
-    for agent_dir in model_dir.iterdir():
-        if not agent_dir.is_dir() or agent_dir.name not in AGENTS:
+    for module_dir in sorted(model_dir.iterdir()):
+        if not module_dir.is_dir():
             continue
-        agent = agent_dir.name
+        module = module_dir.name
 
-        for module_dir in sorted(agent_dir.parent.iterdir()):
-            if not module_dir.is_dir():
+        for agent_dir in module_dir.iterdir():
+            if not agent_dir.is_dir() or agent_dir.name not in AGENTS:
                 continue
-            module = module_dir.name
-            agent_path = module_dir / agent
-            if not agent_path.exists():
-                continue
+            agent = agent_dir.name
 
-            for diff_dir in agent_path.iterdir():
+            for diff_dir in agent_dir.iterdir():
                 if not diff_dir.is_dir():
                     continue
                 difficulty = diff_dir.name
