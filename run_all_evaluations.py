@@ -31,6 +31,47 @@ def get_law_versions_for_difficulty(module_name, difficulty):
         print(f"Could not get law versions for {module_name} ({difficulty}): {e}")
         return []
 
+# Default location of the representative subset (see configs/representative_subset.json,
+# built by configs/generate_subset.py).
+#
+# Each cell of the paper's Table 2 / Appendix B.1 is a mean over 12 runs (3 law
+# versions x 4 trials) for one (module, difficulty, system) combination -- so a
+# cell's reported value is always a multiple of 1/12 (e.g. 91.7% = 11/12). Running
+# fewer than 3 versions for a cell can never reproduce that resolution, so this
+# subset does NOT thin versions or trials within a cell it runs. Instead it thins
+# which CELLS get run: for each of the 12 modules, only 2 of its 9 (difficulty,
+# system) cells are run, but those 2 are run at FULL fidelity (all 3 versions x 4
+# trials), making their numbers directly comparable to the corresponding entries
+# in Appendix B.1. trials_per_law is left at the paper's default (4) regardless of
+# subsetting -- deliberately NOT reduced, so each configuration keeps full retry
+# slack in case a trial fails.
+#
+# 12 modules x 2 cells x 3 versions = 72 configurations, x 4 trials/law = 288
+# total trials per (model, agent_backend), vs. 324 configs / 1,296 trials full.
+DEFAULT_SUBSET_FILE = os.path.join('configs', 'representative_subset.json')
+DEFAULT_TRIALS = 4
+
+# A subset file is {module: [{"difficulty": d, "system": s}, ...]} -- the explicit
+# whitelist of (difficulty, system) cells to run for that module, each at full
+# law-version fidelity. SubsetCells is that whitelist, as a Dict[module] -> Set[(difficulty, system)].
+SubsetCells = Dict[str, set]
+
+
+def load_subset_cells(subset_file: str) -> SubsetCells:
+    """Load a {module: [{"difficulty": d, "system": s}, ...]} cell whitelist from JSON.
+
+    Returns an empty dict (meaning "no restriction") if the file doesn't exist so
+    that this feature degrades gracefully rather than hard failing.
+    """
+    if not subset_file or not os.path.exists(subset_file):
+        return {}
+    with open(subset_file, 'r') as f:
+        raw = json.load(f)
+    return {
+        module_name: {(cell["difficulty"], cell["system"]) for cell in cells}
+        for module_name, cells in raw.items()
+    }
+
 def get_experiment_path(model_name: str, module: str, agent_backend: str, difficulty: str, 
                        law_version: str, system: str, noise_level: float) -> str:
     """Generate standardized experiment directory path."""
@@ -116,11 +157,25 @@ def check_experiment_completion(experiment_path: str, expected_trials: int = 4, 
     is_complete = valid_trials >= expected_from_config
     return is_complete, valid_trials, expected_from_config
 
+def cell_allowed(subset_cells: Dict[str, set], module_name: str, difficulty: str, system: str,
+                  restrict_cells: bool) -> bool:
+    """True if (module, difficulty, system) should run, given the subset whitelist."""
+    if not restrict_cells:
+        return True
+    allowed = subset_cells.get(module_name)
+    if not allowed:
+        return False  # module has no whitelisted cells -> skip entirely
+    return (difficulty, system) in allowed
+
+
 def count_total_configurations(modules: List[str], difficulties: List[str], systems: List[str], 
                              law_versions_map: Dict[str, Dict[str, List[str]]], 
-                             noise_levels: List[float], args) -> int:
+                             noise_levels: List[float], args,
+                             subset_cells: Optional[Dict[str, set]] = None,
+                             restrict_cells: bool = False) -> int:
     """Calculate total number of experiment configurations."""
     total = 0
+    subset_cells = subset_cells or {}
     
     # Apply filters
     filtered_modules = [args.module] if args.module != "none" else modules
@@ -133,6 +188,8 @@ def count_total_configurations(modules: List[str], difficulties: List[str], syst
                 if module_name in law_versions_map and difficulty in law_versions_map[module_name]:
                     law_versions = law_versions_map[module_name][difficulty]
                     for system in filtered_systems:
+                        if not cell_allowed(subset_cells, module_name, difficulty, system, restrict_cells):
+                            continue
                         total += len(law_versions)
     
     return total
@@ -171,14 +228,39 @@ def main():
     parser.add_argument("--model_name", type=str, default="gpt41mini", help="Name of the LLM to use.")
     parser.add_argument("--module", type=str, default="none", help="Name of the module to test (e.g., m0_gravity). Use 'none' for all modules.")
     parser.add_argument("-n", "--noise", type=float, default=0.0, help="Noise level for experiments (e.g., 0, 0.01, 0.1).")
-    parser.add_argument("-t", "--trials_per_law", type=int, default=4, help="Number of trials to run for each law version.")
+    parser.add_argument("-t", "--trials_per_law", type=int, default=DEFAULT_TRIALS,
+                      help=f"Number of trials to run for each law version. Defaults to {DEFAULT_TRIALS} "
+                           f"(the paper's default) regardless of subsetting -- kept full intentionally so "
+                           f"each configuration still has enough trials to absorb the occasional API failure.")
     parser.add_argument("-d", "--equation_difficulty", type=str, default="none", choices=["easy", "medium", "hard", "none"],
                       help="Difficulty level of the equation: easy, medium, or hard.")
     parser.add_argument("-m", "--model_system", type=str, default="none", choices=["vanilla_equation", "simple_system", "complex_system", "none"],
                       help="Model system selected to test the agent: vanilla_equation, simple_system, complex_system")
-    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
+    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent"],
                       help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
-    
+
+    # Subsetting options (for fast iteration while staying comparable to specific
+    # cells of the paper's Table 2 / Appendix B.1).
+    parser.add_argument("--subset_file", type=str, default=DEFAULT_SUBSET_FILE,
+                      help="Path to a JSON file of {module: [{\"difficulty\": d, \"system\": s}, ...]} "
+                           "whitelisting which (difficulty, system) cells to run for each module. Defaults "
+                           "to configs/representative_subset.json. Whitelisted cells are always run at FULL "
+                           "fidelity (all law versions x the full trials_per_law), so their numbers land in "
+                           "the same 1/(versions*trials) resolution as the paper and are directly comparable "
+                           "to the corresponding Appendix B.1 entries. Cells not listed for a module are "
+                           "skipped entirely -- there is no partial-fidelity option, since averaging over "
+                           "fewer than 3 law versions can never reproduce the paper's per-cell resolution.")
+    parser.add_argument("--full", action="store_true",
+                      help="Disable subsetting and run the complete 324-task benchmark (all 12 modules, all "
+                           "9 difficulty x system cells, all 3 law versions), matching the original paper's "
+                           "full protocol exactly.")
+    parser.add_argument("--full_module", action="store_true",
+                      help="Only meaningful together with --module: ignore the subset whitelist for that one "
+                           "module and run its complete 3x3 difficulty x system grid, even though it's covered "
+                           "by the subset file. (Without this flag, --module together with an active subset "
+                           "restricts to that module's whitelisted cells -- this is what lets run_master.py "
+                           "orchestrate a subset run by invoking one module at a time.)")
+
     # Resume and control options
     parser.add_argument("--force_rerun", action="store_true", 
                       help="Force re-run even if experiments are already complete")
@@ -200,6 +282,51 @@ def main():
     systems = ["vanilla_equation", "simple_system", "complex_system"]
     noise_levels = [args.noise]
 
+    # Resolve subsetting: --full disables it outright. Otherwise load the cell
+    # whitelist (if present) and decide whether to restrict:
+    #   - args.module == "none": restrict globally across all modules (the normal
+    #     multi-module run).
+    #   - args.module given AND covered by the whitelist AND --full_module not set:
+    #     restrict to just that module's whitelisted cells. This is what lets
+    #     run_master.py orchestrate a full subset run by invoking run_all_evaluations.py
+    #     once per module with an explicit --module -- if an explicit --module always
+    #     bypassed the whitelist, that orchestration would silently balloon back up
+    #     to the full 324-config benchmark.
+    #   - args.module given but NOT covered by the whitelist, or --full_module set:
+    #     run that module's full 3x3 grid (nothing to restrict to, or explicitly asked).
+    subset_cells = {} if args.full else load_subset_cells(args.subset_file)
+    subset_active = bool(subset_cells)
+    if not subset_active or args.full_module:
+        restrict_cells = False
+    elif args.module == "none":
+        restrict_cells = True
+    else:
+        restrict_cells = args.module in subset_cells
+
+    if args.full:
+        print("Running FULL benchmark protocol (324 tasks): all 12 modules, all 9 cells, all law versions.")
+    elif subset_active:
+        if restrict_cells and args.module == "none":
+            total_cells = sum(len(v) for v in subset_cells.values())
+            print(f"Using representative subset from '{args.subset_file}': {total_cells} (module, difficulty, "
+                  f"system) cells across {len(subset_cells)} modules, each run at FULL fidelity (all law "
+                  f"versions x {args.trials_per_law} trials) so results are directly comparable to the "
+                  f"matching Appendix B.1 entries. Pass --full to run the complete 324-task benchmark instead.")
+        elif restrict_cells:
+            cells = sorted(subset_cells[args.module])
+            print(f"Using representative subset from '{args.subset_file}' for module '{args.module}': "
+                  f"restricting to its {len(cells)} whitelisted cell(s) {cells}, run at FULL fidelity. Pass "
+                  f"--full_module to run this module's complete 3x3 grid instead.")
+        elif args.full_module:
+            print(f"--full_module given: running the complete 3x3 grid for module '{args.module}', "
+                  f"ignoring the subset whitelist.")
+        else:
+            print(f"Module '{args.module}' has no entries in the subset whitelist -- running its complete "
+                  f"3x3 grid.")
+    else:
+        print(f"Subset file '{args.subset_file}' not found -- running the full set of modules and cells "
+              f"(pass --full to silence this message, or run configs/generate_subset.py).")
+
     # Pre-compute law versions for all modules and difficulties
     print("Scanning available law versions...")
     law_versions_map = defaultdict(dict)
@@ -208,9 +335,10 @@ def main():
             law_versions = get_law_versions_for_difficulty(module_name, difficulty)
             if law_versions:
                 law_versions_map[module_name][difficulty] = law_versions
-    
+
     # Calculate total configurations
-    total_configs = count_total_configurations(modules, difficulties, systems, law_versions_map, noise_levels, args)
+    total_configs = count_total_configurations(modules, difficulties, systems, law_versions_map, noise_levels,
+                                                 args, subset_cells=subset_cells, restrict_cells=restrict_cells)
     
     print("\n" + "="*80)
     print("EXPERIMENT CONFIGURATION SUMMARY")
@@ -267,6 +395,8 @@ def main():
                 law_versions = law_versions_map[module_name][difficulty]
                 
                 for system in filtered_systems:   
+                    if not cell_allowed(subset_cells, module_name, difficulty, system, restrict_cells):
+                        continue
                     for law_version in law_versions:
                         config_name = get_configuration_name(module_name, difficulty, system, law_version, noise_level)
                         experiment_path = get_experiment_path(args.model_name, module_name, args.agent_backend, 

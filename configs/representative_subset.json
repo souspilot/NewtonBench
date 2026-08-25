@@ -1,0 +1,122 @@
+{
+  "m0_gravity": [
+    {
+      "difficulty": "easy",
+      "system": "vanilla_equation"
+    },
+    {
+      "difficulty": "medium",
+      "system": "simple_system"
+    }
+  ],
+  "m10_be_distribution": [
+    {
+      "difficulty": "easy",
+      "system": "simple_system"
+    },
+    {
+      "difficulty": "medium",
+      "system": "complex_system"
+    }
+  ],
+  "m11_heat_transfer": [
+    {
+      "difficulty": "easy",
+      "system": "complex_system"
+    },
+    {
+      "difficulty": "hard",
+      "system": "vanilla_equation"
+    }
+  ],
+  "m1_coulomb_force": [
+    {
+      "difficulty": "medium",
+      "system": "vanilla_equation"
+    },
+    {
+      "difficulty": "hard",
+      "system": "simple_system"
+    }
+  ],
+  "m2_magnetic_force": [
+    {
+      "difficulty": "medium",
+      "system": "simple_system"
+    },
+    {
+      "difficulty": "hard",
+      "system": "complex_system"
+    }
+  ],
+  "m3_fourier_law": [
+    {
+      "difficulty": "medium",
+      "system": "complex_system"
+    },
+    {
+      "difficulty": "easy",
+      "system": "vanilla_equation"
+    }
+  ],
+  "m4_snell_law": [
+    {
+      "difficulty": "hard",
+      "system": "vanilla_equation"
+    },
+    {
+      "difficulty": "easy",
+      "system": "simple_system"
+    }
+  ],
+  "m5_radioactive_decay": [
+    {
+      "difficulty": "hard",
+      "system": "simple_system"
+    },
+    {
+      "difficulty": "easy",
+      "system": "complex_system"
+    }
+  ],
+  "m6_underdamped_harmonic": [
+    {
+      "difficulty": "hard",
+      "system": "complex_system"
+    },
+    {
+      "difficulty": "medium",
+      "system": "vanilla_equation"
+    }
+  ],
+  "m7_malus_law": [
+    {
+      "difficulty": "easy",
+      "system": "vanilla_equation"
+    },
+    {
+      "difficulty": "medium",
+      "system": "simple_system"
+    }
+  ],
+  "m8_sound_speed": [
+    {
+      "difficulty": "easy",
+      "system": "simple_system"
+    },
+    {
+      "difficulty": "medium",
+      "system": "complex_system"
+    }
+  ],
+  "m9_hooke_law": [
+    {
+      "difficulty": "easy",
+      "system": "complex_system"
+    },
+    {
+      "difficulty": "hard",
+      "system": "vanilla_equation"
+    }
+  ]
+}

@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import List, Sequence
 
 
+DEFAULT_SUBSET_FILE = os.path.join("configs", "representative_subset.json")
+
+
 def discover_modules(modules_root: Path) -> List[str]:
     if not modules_root.exists():
         raise FileNotFoundError(f"Modules directory not found: {modules_root}")
@@ -16,6 +19,24 @@ def discover_modules(modules_root: Path) -> List[str]:
     if not modules:
         raise RuntimeError("No modules discovered under 'modules/'")
     return modules
+
+
+def filter_modules_by_subset(modules: Sequence[str], subset_file: str) -> List[str]:
+    """Restrict the module list to those with at least one whitelisted cell in subset_file.
+
+    run_master.py calls run_all_evaluations.py once per module with an explicit
+    --module flag. run_all_evaluations.py restricts to that module's whitelisted
+    cells when the module IS covered by the subset (this is what makes per-module
+    orchestration compose correctly with subsetting), but runs a module's full 3x3
+    grid if it has NO entries in the subset file at all -- so modules absent from
+    the file are filtered out here to avoid accidentally running them in full.
+    """
+    if not subset_file or not os.path.exists(subset_file):
+        return list(modules)
+    with open(subset_file, "r") as f:
+        subset_map = json.load(f)
+    kept = [m for m in modules if subset_map.get(m)]
+    return kept if kept else list(modules)
 
 
 def read_models_from_file(models_file: Path) -> List[str]:
@@ -51,6 +72,9 @@ def build_commands(
     repo_root: Path,
     modules: Sequence[str],
     models: Sequence[str],
+    full: bool = False,
+    subset_file: str = "",
+    trials_per_law: int = 0,
 ) -> List[List[str]]:
     run_all = repo_root / "run_all_evaluations.py"
     if not run_all.exists():
@@ -58,7 +82,7 @@ def build_commands(
     commands: List[List[str]] = []
     for model in models:
         for module in modules:
-            for backend in ["vanilla_agent", "code_assisted_agent", "planned_agent"]:
+            for backend in ["vanilla_agent", "code_assisted_agent"]:
                 cmd = [
                     "python",
                     "run_all_evaluations.py",
@@ -70,6 +94,12 @@ def build_commands(
                     backend,
                     "--no_prompt",
                 ]
+                if full:
+                    cmd.append("--full")
+                elif subset_file:
+                    cmd.extend(["--subset_file", subset_file])
+                if trials_per_law:
+                    cmd.extend(["--trials_per_law", str(trials_per_law)])
                 commands.append(cmd)
     return commands
 
@@ -195,6 +225,27 @@ def main():
         action="store_true",
         help="Only print the commands that would be run and exit.",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run the complete 324-task benchmark instead of the representative subset "
+             "(configs/representative_subset.json) that run_all_evaluations.py uses by default.",
+    )
+    parser.add_argument(
+        "--subset_file",
+        type=str,
+        default="",
+        help="Override the subset file passed to run_all_evaluations.py (default: its own built-in default, "
+             "configs/representative_subset.json). Ignored if --full is set.",
+    )
+    parser.add_argument(
+        "--trials_per_law",
+        type=int,
+        default=0,
+        help="Override trials per law version passed to run_all_evaluations.py "
+             "(default: its own built-in default of 4, kept full even when subsetting "
+             "so each configuration has slack for retries).",
+    )
 
     args = parser.parse_args()
 
@@ -202,7 +253,18 @@ def main():
     modules = discover_modules(repo_root / "modules")
     models = resolve_models(repo_root, args.model_name, Path(args.models_file))
 
-    commands = build_commands(repo_root, modules, models)
+    if not args.full:
+        subset_file_for_modules = args.subset_file or DEFAULT_SUBSET_FILE
+        filtered = filter_modules_by_subset(modules, subset_file_for_modules)
+        if len(filtered) < len(modules):
+            print(f"Subset active: running {len(filtered)}/{len(modules)} modules "
+                  f"({', '.join(filtered)}). Pass --full to run all {len(modules)} modules.")
+        modules = filtered
+
+    commands = build_commands(
+        repo_root, modules, models,
+        full=args.full, subset_file=args.subset_file, trials_per_law=args.trials_per_law,
+    )
 
     # Always show the commands before running
     print("Planned commands ({} total):".format(len(commands)))
