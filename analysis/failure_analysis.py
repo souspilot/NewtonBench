@@ -1,300 +1,248 @@
 """
-Judge-independent failure analysis for a model's NewtonBench trials.
+Judge-independent "constant-equivalence" check.
 
-Combines three independent signals per trial, so no single one has to be
-trusted blindly:
+Given a trial's submitted_law (a full Python function definition string) and its
+ground_truth_law (an expression string, e.g. with a HIDDEN_CONSTANT or CONSTANT
+placeholder standing in for whatever exact physical constant the model can't see:
+"HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) / distance ** 2"), this determines
+-- via sympy, not an LLM -- whether the submitted expression has the SAME
+functional form as ground truth, differing only by a constant multiplicative
+factor. This is exactly the equivalence notion the paper's LLM judge is supposed
+to check ("intentionally disregards the values of physical constants"), but
+computed deterministically, so it can be used to sanity-check (or substitute for)
+judge verdicts.
 
-  1. judge_verdict      -- symbolic_equivalent, as decided by the LLM judge
-                            (self-judged for models where judge_model_name ==
-                            model_name -- the thing you don't fully trust).
-  2. rmsle_verdict       -- purely numeric: is RMSLE below a "this is
-                            essentially an exact fit" threshold? Independent of
-                            any LLM. Outlier-cleaned the same way
-                            summarize_results.py does (Modified Z-Score per
-                            (module, difficulty, system, agent_backend) group)
-                            so a single bad trial doesn't get miscompared
-                            against a threshold tuned for typical trials.
-  3. structural_verdict  -- from structural_equivalence.py: deterministic
-                            sympy check of whether submitted_law has the same
-                            functional form as ground_truth_law up to a
-                            constant factor. No LLM, no numeric threshold --
-                            pure symbolic manipulation. Falls back to
-                            'not_checkable' for anything with control flow
-                            rather than guessing.
+Approach:
+  1. Parse submitted_law with `ast`. Function parameters become sympy symbols
+     (declared `positive=True`, since every physical quantity in this benchmark
+     -- mass, distance, temperature, etc. -- is a positive real, and this
+     assumption is what lets sympy safely split/combine things like
+     sqrt(a*b) <-> sqrt(a)*sqrt(b) during simplification).
+  2. Walk the function body IN ORDER. Each `name = <expr>` assignment is
+     evaluated to a sympy expression using whatever's been resolved so far, and
+     substituted in place for later references to `name` -- it is NOT abstracted
+     into an opaque "this could be any constant" symbol. This matters: an
+     assignment can be a genuine constant (`C = 6.674e-5`) or an intermediate
+     expression that depends on the function's parameters (`sin_t =
+     math.sin(theta)`) or even a value that must match ground truth exactly
+     (`exponent = 2.6`) -- treating all three the same way (as an earlier
+     version of this function did) silently destroys parameter-dependence and
+     erases exact-value matches that should count as equal.
+  3. Convert ground_truth_law the same way, using the SAME parameter symbols.
+     Any name that isn't a declared parameter (HIDDEN_CONSTANT, CONSTANT, k,
+     ...) is auto-created as a free symbol representing "the actual physical
+     constant" -- this is the ONLY thing that gets treated as freely
+     substitutable.
+  4. Simplify submitted / ground_truth. If nothing depending on the function's
+     actual parameters remains (only numbers and/or the ground-truth constant
+     placeholder), the two are constant-equivalent -- same functional form,
+     differing only in a multiplicative factor. Because submitted's constants
+     were plugged in as literal numbers rather than abstracted, this also
+     correctly rejects a WRONG exponent or coefficient that happens to be
+     stored in a named local variable, while still accepting a wrong-but-
+     correctly-placed constant (e.g. 6.674e-55 instead of 6.674e-5).
 
-The interesting rows are where these DISAGREE:
-
-  - judge=True,  rmsle=False -> "judge_lenient": judge said correct but the
-    numbers don't back it up (e.g. right form, catastrophically wrong
-    constant -- see the qwen38-27b 6.674e-55 case earlier in this project).
-    structural_verdict helps disambiguate: constant_equivalent here CONFIRMS
-    "right form, bad constant" (numerically bad, but arguably still a
-    legitimate symbolic-accuracy credit per the paper's own "ignore
-    constants" rule); structurally_different here is a much more serious
-    judge error -- the judge called something equivalent that sympy says
-    genuinely isn't.
-
-  - judge=False, rmsle=True  -> "judge_strict": judge said wrong but RMSLE is
-    essentially exact. Possible false negative -- an algebraically equivalent
-    but differently-written formula the judge failed to recognize.
-
-Usage:
-    python analysis/failure_analysis.py --model qwq-32b
-    python analysis/failure_analysis.py --model qwq-32b --module m0_gravity
-    python analysis/failure_analysis.py --model qwq-32b --rmsle_threshold 1e-3
+Limitations (fails closed -- returns "not_checkable" rather than a wrong
+verdict): functions with control flow (if/for/while/try), multiple return
+statements, or calls beyond a small whitelist of math functions are not
+auto-checked and should be reviewed manually.
 """
-import argparse
-import json
-import re
-import sys
-from pathlib import Path
+import ast
+import sympy as sp
 
-import numpy as np
-import pandas as pd
-
-# summarize_results.py and structural_equivalence.py both live alongside this
-# script in analysis/ now, so a plain same-directory import works.
-from summarize_results import detect_outliers_modified_zscore_column  # noqa: E402
-from structural_equivalence import check_constant_equivalence  # noqa: E402
-
-DEFAULT_RMSLE_THRESHOLD = 1e-3  # well above float-precision noise (~1e-16), well below a
-                                  # genuinely-wrong-constant trial's RMSLE (order 1+ in our examples)
+_MATH_FUNCS = {
+    "sqrt": sp.sqrt, "exp": sp.exp, "log": sp.log, "sin": sp.sin, "cos": sp.cos,
+    "tan": sp.tan, "abs": sp.Abs, "pow": lambda a, b: a ** b,
+}
+_MATH_CONSTS = {"pi": sp.pi, "e": sp.E}
 
 
-def _path_version(trial_path: Path) -> int:
-    """Extract the trailing _vN from a config directory
-    (e.g. '.../vanilla_equation_noise0_0_v2' -> 2), matching
-    summarize_results.py's extract_version_from_path. Re-runs of the same
-    logical config land in a new v2/v3/... directory (see get_experiment_path
-    in run_all_evaluations.py); this is how we tell "the current results" from
-    "a stale earlier attempt" for the SAME (module, difficulty, system,
-    law_version, agent_backend, trial_id).
+class NotCheckable(Exception):
+    pass
+
+
+def _ast_to_sympy(node, symbol_map):
+    if isinstance(node, ast.BinOp):
+        left = _ast_to_sympy(node.left, symbol_map)
+        right = _ast_to_sympy(node.right, symbol_map)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+        raise NotCheckable(f"Unsupported binop: {type(node.op).__name__}")
+    if isinstance(node, ast.UnaryOp):
+        val = _ast_to_sympy(node.operand, symbol_map)
+        if isinstance(node.op, ast.USub):
+            return -val
+        if isinstance(node.op, ast.UAdd):
+            return val
+        raise NotCheckable(f"Unsupported unaryop: {type(node.op).__name__}")
+    if isinstance(node, ast.Name):
+        if node.id not in symbol_map:
+            # Not a declared parameter and not assigned yet in this function --
+            # e.g. ground_truth_law's HIDDEN_CONSTANT/CONSTANT/k placeholder.
+            # Treat it as a free "the real constant" symbol.
+            symbol_map[node.id] = sp.Symbol(node.id, positive=True)
+        return symbol_map[node.id]
+    if isinstance(node, ast.Constant):
+        return sp.nsimplify(node.value) if isinstance(node.value, (int, float)) else node.value
+    if isinstance(node, ast.Call):
+        fname = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
+        if fname not in _MATH_FUNCS:
+            raise NotCheckable(f"Unsupported function call: {fname}")
+        args = [_ast_to_sympy(a, symbol_map) for a in node.args]
+        return _MATH_FUNCS[fname](*args)
+    if isinstance(node, ast.Attribute):
+        if node.attr in _MATH_CONSTS:
+            return _MATH_CONSTS[node.attr]
+        raise NotCheckable(f"Unsupported attribute: {node.attr}")
+    raise NotCheckable(f"Unsupported node type: {type(node).__name__}")
+
+
+def _eval_function_body(param_names, body_stmts):
+    """Walk a function body in order, resolving each local assignment to a
+    sympy expression (substituted, not abstracted) and returning the final
+    return-statement's sympy expression. `symbol_map` starts with only the
+    declared parameters as (positive) symbols; local names get added as their
+    RESOLVED VALUE, so later statements/the return correctly reflect whatever
+    that name actually computes to -- whether it's a bare number, a parameter-
+    dependent expression, or a value that must match ground truth exactly.
     """
-    config_dir = trial_path.parent.parent  # up from trials/
-    m = re.search(r"v(\d+)$", str(config_dir).rstrip("/"))
-    return int(m.group(1)) if m else 0
+    symbol_map = {name: sp.Symbol(name, positive=True) for name in param_names}
+    return_expr = None
 
-
-def load_trials(result_dir: str, model: str) -> pd.DataFrame:
-    model_dir = Path(result_dir) / model
-    if not model_dir.is_dir():
-        raise SystemExit(f"No such directory: {model_dir}")
-
-    rows = []
-    for trials_dir in model_dir.rglob("trials"):
-        for trial_path in sorted(trials_dir.glob("trial*.json")):
-            if trial_path.name.endswith("_fail.json"):
-                continue
-            try:
-                with open(trial_path) as f:
-                    data = json.load(f)
-            except Exception as e:
-                print(f"Skipping unreadable {trial_path}: {e}")
-                continue
-
-            ev = data.get("evaluation", {}) or {}
-            rows.append(dict(
-                path=str(trial_path),
-                path_version=_path_version(trial_path),
-                trial_id=data.get("trial_id"),
-                module=data.get("module_name"),
-                equation_difficulty=data.get("equation_difficulty"),
-                model_system=data.get("model_system"),
-                law_version=data.get("law_version"),
-                agent_backend=data.get("agent_backend"),
-                rmsle=ev.get("rmsle"),
-                exact_accuracy=ev.get("exact_accuracy"),
-                symbolic_equivalent=ev.get("symbolic_equivalent"),
-                symbolic_msg=ev.get("symbolic_msg"),
-                submitted_law=data.get("submitted_law"),
-                ground_truth_law=ev.get("ground_truth_law"),
-                rounds=data.get("rounds"),
-                num_experiments=data.get("num_experiments"),
-                total_tokens=data.get("total_tokens"),
-            ))
-    if not rows:
-        raise SystemExit(f"No trial files found under {model_dir}")
-    df = pd.DataFrame(rows)
-    df["rmsle"] = df["rmsle"].replace([np.inf, -np.inf], np.nan)
-
-    # De-duplicate exactly the way summarize_results.py's update_results() does:
-    # one row per (module, difficulty, system, law_version, agent_backend, trial_id),
-    # keeping only the highest-numbered config directory version. Without this,
-    # stale re-run directories (_v1, _v2, ... from earlier partial/aborted runs)
-    # get counted as if they were independent trials, silently inflating counts
-    # and double-weighting whatever happened to be re-run more often.
-    identity_cols = ["module", "equation_difficulty", "model_system", "law_version",
-                      "agent_backend", "trial_id"]
-    before = len(df)
-    df = (df.sort_values("path_version")
-            .drop_duplicates(subset=identity_cols, keep="last")
-            .reset_index(drop=True))
-    dropped = before - len(df)
-    if dropped:
-        print(f"Dropped {dropped} stale duplicate trial(s) from older re-run directories "
-              f"(kept the highest _vN version per logical config).")
-
-    return df
-
-
-def clean_rmsle_outliers(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["rmsle_cleaned"] = df["rmsle"]
-    groups = df.groupby(["module", "equation_difficulty", "model_system", "agent_backend"])
-    cleaned = []
-    for _, g in groups:
-        g2 = g.copy()
-        g2["rmsle_cleaned"] = g2["rmsle"]
-        g2 = detect_outliers_modified_zscore_column(g2, "rmsle_cleaned")
-        cleaned.append(g2)
-    return pd.concat(cleaned).reset_index(drop=True)
-
-
-def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
-    df = df.copy()
-    df["judge_verdict"] = df["symbolic_equivalent"].fillna(False).astype(bool)
-    # Use the UN-cleaned rmsle for this trial's own verdict -- outlier cleaning is for
-    # aggregate stats, not for judging one trial's own fit quality.
-    df["rmsle_verdict"] = df["rmsle"] < rmsle_threshold
-
-    structural = []
-    for _, row in df.iterrows():
-        if not isinstance(row["submitted_law"], str) or not isinstance(row["ground_truth_law"], str):
-            structural.append("not_checkable")
+    for stmt in body_stmts:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            symbol_map[stmt.targets[0].id] = _ast_to_sympy(stmt.value, symbol_map)
+        elif isinstance(stmt, ast.Return):
+            return_expr = stmt.value
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
             continue
-        structural.append(check_constant_equivalence(row["submitted_law"], row["ground_truth_law"]))
-    df["structural_verdict"] = structural
+        else:
+            raise NotCheckable(f"Unsupported statement type: {type(stmt).__name__}")
 
-    def bucket(row):
-        j = row["judge_verdict"]
-        sv = row["structural_verdict"]
-        # Prefer the deterministic sympy check whenever it reached a verdict --
-        # it needs no arbitrary threshold. RMSLE-based rmsle_verdict is only
-        # trustworthy as a fallback for genuinely not_checkable trials (control
-        # flow etc.), since a fixed RMSLE threshold can't distinguish "exact"
-        # from "coincidentally close over the sampled domain but structurally
-        # wrong" (e.g. exponent 2.5 vs 2.6 barely diverging within the tested
-        # input range).
-        if sv == "constant_equivalent":
-            return "consistent_pass" if j else "judge_strict"
-        if sv == "structurally_different":
-            return "judge_lenient" if j else "consistent_fail"
-        # not_checkable: fall back to the RMSLE threshold, the only signal left.
-        r = row["rmsle_verdict"]
-        if j and r:
-            return "consistent_pass"
-        if not j and not r:
-            return "consistent_fail"
-        if j and not r:
-            return "judge_lenient"
-        return "judge_strict"
-    df["agreement_bucket"] = df.apply(bucket, axis=1)
-    return df
+    if return_expr is None:
+        raise NotCheckable("No return statement found")
+    return _ast_to_sympy(return_expr, symbol_map), {symbol_map[n] for n in param_names}
 
 
-def print_summary(df: pd.DataFrame, top_n: int):
-    print(f"\nTotal unique trials analyzed: {len(df)}\n")
-    print("NOTE: agreement_bucket now trusts structural_verdict (deterministic, no threshold) "
-          "over rmsle_verdict whenever sympy reached a verdict. rmsle_verdict/--rmsle_threshold "
-          "only decide the bucket for not_checkable trials. This matters because a fixed RMSLE "
-          "threshold can't tell 'genuinely exact' apart from 'coincidentally close over the "
-          "sampled input domain but structurally wrong' (e.g. a wrong exponent that barely "
-          "diverges within the tested range) -- if you see a judge_strict/judge_lenient count "
-          "that seems too high, check whether it's dominated by not_checkable trials before "
-          "trusting it as evidence of judge unreliability.")
+def submitted_law_to_sympy(submitted_law_src: str):
+    """Parse a `def discovered_law(...): ...` source string into a sympy
+    expression. Returns (expr, param_symbols). Local constants and
+    intermediate expressions are fully substituted in -- nothing about
+    submitted_law is left abstract except its declared parameters."""
+    tree = ast.parse(submitted_law_src)
+    func_nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+    if not func_nodes:
+        raise NotCheckable("No function definition found")
+    func_node = func_nodes[0]
+    param_names = [a.arg for a in func_node.args.args]
+    return _eval_function_body(param_names, func_node.body)
 
-    print("\n=== Agreement bucket counts ===")
-    print(df["agreement_bucket"].value_counts().to_string())
 
-    print("\n=== judge_lenient trials, broken down by structural_verdict ===")
-    lenient = df[df["agreement_bucket"] == "judge_lenient"]
-    if lenient.empty:
-        print("(none)")
-    else:
-        print(lenient["structural_verdict"].value_counts().to_string())
-        print("\n  constant_equivalent = right form, bad constant (numerically off, arguably still")
-        print("    deserves symbolic credit per the paper's own 'ignore constants' rule)")
-        print("  structurally_different = judge called it equivalent but sympy disagrees --")
-        print("    the more concerning kind of judge error")
-        print("  not_checkable = control flow / unsupported ops in submitted_law, needs manual review")
+def ground_truth_to_sympy(ground_truth_str: str, param_names):
+    """Parse a ground_truth_law expression string into a sympy expression,
+    using the SAME parameter symbols as submitted_law_to_sympy. Any other name
+    encountered (HIDDEN_CONSTANT, CONSTANT, k, ...) is auto-created as a free
+    symbol via _ast_to_sympy's Name handling."""
+    symbol_map = {name: sp.Symbol(name, positive=True) for name in param_names}
+    tree = ast.parse(ground_truth_str, mode="eval")
+    expr = _ast_to_sympy(tree.body, symbol_map)
+    return expr
 
-    print("\n=== judge_strict trials (possible judge false negatives) ===")
-    strict = df[df["agreement_bucket"] == "judge_strict"]
-    if strict.empty:
-        print("(none)")
-    else:
-        print(strict["structural_verdict"].value_counts().to_string())
 
-    print("\n=== Breakdown by module ===")
-    print(pd.crosstab(df["module"], df["agreement_bucket"]).to_string())
+def check_constant_equivalence(submitted_law_src: str, ground_truth_str: str):
+    """Returns one of: 'constant_equivalent', 'structurally_different', 'not_checkable'.
 
-    # The genuinely actionable subset: judge_lenient trials where sympy says the
-    # forms are actually different (not just a constant mismatch) -- these are
-    # real judge errors, not benign "ignored the constant" cases.
-    concerning = lenient[lenient["structural_verdict"] == "structurally_different"].copy()
-    if not concerning.empty:
-        concerning["severity"] = concerning["rmsle"]
-        concerning = concerning.sort_values("severity", ascending=False)
-        print(f"\n=== Top {min(top_n, len(concerning))} most concerning judge errors "
-              f"(judge said equivalent, sympy disagrees, sorted by RMSLE) ===")
-        show_cols = ["module", "equation_difficulty", "model_system", "law_version",
-                     "agent_backend", "trial_id", "rmsle", "path"]
-        print(concerning[show_cols].head(top_n).to_string(index=False))
-    else:
-        print("\nNo structurally_different judge_lenient cases -- every judge_lenient trial is "
-              "explainable as a constant-fitting error, not a genuine judge mistake.")
+    'constant_equivalent' means submitted/ground_truth simplifies to something
+    containing none of submitted's declared parameters -- i.e. same functional
+    form, differing only by a constant factor (exactly what the paper's judge
+    is instructed to ignore). Any wrong exponent, wrong operator, extra/missing
+    term, or genuinely different parameter-dependence will leave parameter
+    symbols in the ratio and correctly return 'structurally_different'.
+    """
+    try:
+        sub_expr, sub_params = submitted_law_to_sympy(submitted_law_src)
+        gt_expr = ground_truth_to_sympy(ground_truth_str, [str(p) for p in sub_params])
 
-    if not strict.empty:
-        strict_sorted = strict.sort_values("rmsle")
-        print(f"\n=== Top {min(top_n, len(strict))} judge_strict trials (lowest RMSLE = most likely "
-              f"false negatives) ===")
-        show_cols = ["module", "equation_difficulty", "model_system", "law_version",
-                     "agent_backend", "trial_id", "rmsle", "structural_verdict", "path"]
-        print(strict_sorted[show_cols].head(top_n).to_string(index=False))
+        ratio = sp.simplify(sub_expr / gt_expr)
+        remaining_physical = ratio.free_symbols & sub_params
+
+        if not remaining_physical:
+            return "constant_equivalent"
+        return "structurally_different"
+    except NotCheckable:
+        return "not_checkable"
+    except Exception:
+        return "not_checkable"
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--result_dir", default="evaluation_results")
-    parser.add_argument("--module", default=None)
-    parser.add_argument("--agent", default=None)
-    parser.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
-    parser.add_argument("--top", type=int, default=15, help="How many concerning trials to print in each ranked list")
-    parser.add_argument("--buckets", default="judge_lenient,judge_strict",
-                         help="Comma-separated agreement_bucket values to include in the exported CSV. "
-                              "Default excludes consistent_pass/consistent_fail (the expected, boring "
-                              "majority) so the CSV itself stays reviewable. Pass 'all' for everything.")
-    parser.add_argument("-o", "--output_csv", default=None,
-                         help="Default: analysis/failure_analysis_<model>.csv")
-    args = parser.parse_args()
+    def check(name, submitted, ground_truth, expected):
+        result = check_constant_equivalence(submitted, ground_truth)
+        status = "OK" if result == expected else f"FAIL (expected {expected})"
+        print(f"[{status}] {name}: {result}")
+        assert result == expected, f"{name}: got {result}, expected {expected}"
 
-    output_csv = args.output_csv or f"analysis/failure_analysis_{args.model}.csv"
+    check(
+        "wrong constant only (6.674e-55 vs 6.674e-5)",
+        "def discovered_law(mass1, mass2, distance):\n    C = 6.674e-55\n    return (C * mass1**2 * mass2**2) / (distance**2)",
+        "HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) / distance ** 2",
+        "constant_equivalent",
+    )
+    check(
+        "wrong exponents entirely (structural mismatch)",
+        "def discovered_law(mass1, mass2, distance):\n   return (mass1 * mass2) / (distance ** 2)",
+        "HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) * distance ** 2",
+        "structurally_different",
+    )
+    check(
+        "unsupported if/else edge-case branch -> not_checkable",
+        "def discovered_law(mass1, mass2, distance):\n    C = 6.674e-5\n    if distance == 0:\n        return float('inf')\n    return C * (mass1 ** 2) * (mass2 ** 2) / (distance ** 2)",
+        "HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) / distance ** 2",
+        "not_checkable",
+    )
+    check(
+        "constant pulled outside sqrt (same form, previously a false positive)",
+        "def discovered_law(gamma, T, M):\n    C = 18.75\n    return C * math.sqrt(T / M)",
+        "math.sqrt(HIDDEN_CONSTANT * T / M)",
+        "constant_equivalent",
+    )
+    check(
+        "exponent matches exactly via a local variable (previously a false positive)",
+        "def discovered_law(mass1, distance):\n    G = 6.67429e-5\n    exponent = 2.6\n    return (G * mass1) / (distance ** exponent)",
+        "HIDDEN_CONSTANT * mass1 / distance ** 2.6",
+        "constant_equivalent",
+    )
+    check(
+        "exponent WRONG via a local variable -- must still be caught",
+        "def discovered_law(mass1, distance):\n    G = 6.674e-5\n    exponent = 2.5\n    return (G * mass1) / (distance ** exponent)",
+        "HIDDEN_CONSTANT * mass1 / distance ** 2.6",
+        "structurally_different",
+    )
+    check(
+        "intermediate parameter-dependent variables, literally identical form (previously a false positive)",
+        "def discovered_law(I_0, theta):\n    import math\n    sin_t = math.sin(theta)\n    cos_t = math.cos(theta)\n    return I_0 * (sin_t + cos_t) ** 2",
+        "I_0 * (np.sin(theta) + np.cos(theta)) ** 2",
+        "constant_equivalent",
+    )
+    check(
+        "constant function vs a genuinely non-constant law -- must be caught",
+        "def discovered_law(omega, T):\n    return 0.5",
+        "1 / (np.exp(HIDDEN_CONSTANT * omega / T) + 1)",
+        "structurally_different",
+    )
+    check(
+        "ground truth uses a bare symbol placeholder ('k') instead of HIDDEN_CONSTANT",
+        "def discovered_law(x):\n    return x**2",
+        "2 * k * x ** 2",
+        "constant_equivalent",
+    )
 
-    df = load_trials(args.result_dir, args.model)
-    if args.module:
-        df = df[df["module"] == args.module]
-    if args.agent:
-        df = df[df["agent_backend"] == args.agent]
-
-    df = clean_rmsle_outliers(df)
-    df = compute_verdicts(df, args.rmsle_threshold)
-
-    print_summary(df, args.top)
-
-    if args.buckets.strip().lower() == "all":
-        export_df = df
-    else:
-        wanted = {b.strip() for b in args.buckets.split(",")}
-        export_df = df[df["agreement_bucket"].isin(wanted)]
-
-    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
-    cols = ["path", "path_version", "module", "equation_difficulty", "model_system", "law_version",
-            "agent_backend", "trial_id", "rmsle", "rmsle_cleaned", "exact_accuracy", "judge_verdict",
-            "rmsle_verdict", "structural_verdict", "agreement_bucket", "symbolic_msg", "submitted_law",
-            "ground_truth_law"]
-    export_df[cols].to_csv(output_csv, index=False)
-    print(f"\n{len(export_df)}/{len(df)} trials (buckets: {args.buckets}) written to {output_csv}")
-    print("Sort/filter that CSV by agreement_bucket to pull up specific trials for manual review "
-          "(the 'path' column points straight at the trial JSON, and 'submitted_law'/'ground_truth_law' "
-          "are inlined so you often won't even need to open it).")
+    print("\nAll sanity checks passed.")
