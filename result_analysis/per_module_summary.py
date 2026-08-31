@@ -23,14 +23,14 @@ Usage:
     python result_analysis/summarize_results.py -m qwq-32b
 
     # Then run this to get the per-module breakdown
-    python analysis/per_module_summary.py --model qwq-32b
+    python result_analysis/per_module_summary.py --model qwq-32b
 
     # Restrict to one module, or one backend
-    python analysis/per_module_summary.py --model qwq-32b --module m0_gravity
-    python analysis/per_module_summary.py --model qwq-32b --agent vanilla_agent
+    python result_analysis/per_module_summary.py --model qwq-32b --module m0_gravity
+    python result_analysis/per_module_summary.py --model qwq-32b --agent vanilla_agent
 
     # Only show cells your subset actually ran (skips all-N/A rows/columns)
-    python analysis/per_module_summary.py --model qwq-32b --subset_file configs/representative_subset.json
+    python result_analysis/per_module_summary.py --model qwq-32b --subset_file configs/representative_subset.json
 """
 import argparse
 import json
@@ -126,7 +126,7 @@ if __name__ == "__main__":
                          help="Path to representative_subset.json -- when given, cells outside the subset "
                               "for a given module are marked '-' instead of 'N/A' (distinguishing 'not run "
                               "by design' from 'ran but produced no valid trials').")
-    parser.add_argument("-o", "--output_csv", default="analysis/per_module_summary.csv")
+    parser.add_argument("-o", "--output_csv", default="result_analysis/per_module_summary.csv")
     args = parser.parse_args()
 
     df = load_trials(args.csv, args.model)
