@@ -35,7 +35,7 @@ from failure_analysis import load_trials, clean_rmsle_outliers, compute_verdicts
 from mismatch_classifier import classify_mismatch  # noqa: E402
 
 MISTAKE_TYPE_ORDER = ["missing_variable", "sign_flip", "extra_variable", "wrong_exponent",
-                       "other_structural", "not_checkable"]
+                       "nonlinear_dependence", "other_structural", "not_checkable"]
 
 MISTAKE_TYPE_BLURB = {
     "missing_variable": "Ground truth depends on a parameter the submitted law ignores entirely.",
@@ -44,10 +44,14 @@ MISTAKE_TYPE_BLURB = {
     "extra_variable": "Submitted law depends on a parameter that ground truth doesn't.",
     "wrong_exponent": "Right variables, right sign, but the wrong exponent magnitude "
                        "(e.g. mass^1 submitted where ground truth is mass^2).",
+    "nonlinear_dependence": "Both submitted and ground truth genuinely depend on a parameter, but "
+                             "at least one side isn't a simple power law in it (wrapped in exp/log/trig, "
+                             "or combined additively) -- confirmed to matter, but not comparable as a "
+                             "single exponent number. Needs a manual read.",
     "other_structural": "No single-parameter exponent mismatch found, but the law is still wrong -- "
                          "likely an operator-level difference (e.g. additive vs multiplicative combination "
                          "of terms) that a per-parameter power-law comparison can't isolate. Needs a manual read.",
-    "not_checkable": "Submitted law uses control flow (if/try/etc.) our automated checker can't parse -- "
+    "not_checkable": "Submitted law uses control flow our automated checker can't parse -- "
                       "needs a manual read.",
 }
 

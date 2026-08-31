@@ -52,7 +52,10 @@ import sympy as sp
 
 _MATH_FUNCS = {
     "sqrt": sp.sqrt, "exp": sp.exp, "log": sp.log, "sin": sp.sin, "cos": sp.cos,
-    "tan": sp.tan, "abs": sp.Abs, "pow": lambda a, b: a ** b,
+    "tan": sp.tan, "asin": sp.asin, "acos": sp.acos, "atan": sp.atan,
+    "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+    "degrees": lambda x: x * 180 / sp.pi, "radians": lambda x: x * sp.pi / 180,
+    "abs": sp.Abs, "pow": lambda a, b: a ** b,
 }
 _MATH_CONSTS = {"pi": sp.pi, "e": sp.E}
 
@@ -113,19 +116,41 @@ def _eval_function_body(param_names, body_stmts):
     RESOLVED VALUE, so later statements/the return correctly reflect whatever
     that name actually computes to -- whether it's a bare number, a parameter-
     dependent expression, or a value that must match ground truth exactly.
+
+    Also unwraps two common "domain guard" patterns rather than treating them
+    as unsupported control flow, since they're extremely common in submitted
+    laws and represent edge-case handling around the core formula, not the
+    formula itself:
+      - `if <cond>: return <fallback>` with no elif/else -- treated as a guard
+        clause and skipped; only the eventual real return is used.
+      - `try: <body> except ...: return <fallback>` -- the try body's
+        statements are spliced in as if unwrapped; the except branch (a
+        fallback for invalid inputs) is ignored.
+    Anything else (a return inside the except branch that ISN'T a simple
+    guard, nested control flow, multiple returns in the main path, etc.)
+    still raises NotCheckable and falls back to manual review.
     """
     symbol_map = {name: sp.Symbol(name, positive=True) for name in param_names}
     return_expr = None
 
-    for stmt in body_stmts:
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-            symbol_map[stmt.targets[0].id] = _ast_to_sympy(stmt.value, symbol_map)
-        elif isinstance(stmt, ast.Return):
-            return_expr = stmt.value
-        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            continue
-        else:
-            raise NotCheckable(f"Unsupported statement type: {type(stmt).__name__}")
+    def process(stmts):
+        nonlocal return_expr
+        for stmt in stmts:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                symbol_map[stmt.targets[0].id] = _ast_to_sympy(stmt.value, symbol_map)
+            elif isinstance(stmt, ast.Return):
+                return_expr = stmt.value
+            elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                continue
+            elif isinstance(stmt, ast.If) and not stmt.orelse and len(stmt.body) == 1 \
+                    and isinstance(stmt.body[0], ast.Return):
+                continue  # guard clause (e.g. domain-error fallback) -- skip it
+            elif isinstance(stmt, ast.Try) and not stmt.orelse and not stmt.finalbody:
+                process(stmt.body)  # splice the try-body in; ignore the except fallback
+            else:
+                raise NotCheckable(f"Unsupported statement type: {type(stmt).__name__}")
+
+    process(body_stmts)
 
     if return_expr is None:
         raise NotCheckable("No return statement found")
@@ -203,8 +228,14 @@ if __name__ == "__main__":
         "structurally_different",
     )
     check(
-        "unsupported if/else edge-case branch -> not_checkable",
+        "simple domain guard (if/return then the real formula) -- now unwrapped, not a failure",
         "def discovered_law(mass1, mass2, distance):\n    C = 6.674e-5\n    if distance == 0:\n        return float('inf')\n    return C * (mass1 ** 2) * (mass2 ** 2) / (distance ** 2)",
+        "HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) / distance ** 2",
+        "constant_equivalent",
+    )
+    check(
+        "genuinely unsupported control flow (if/elif with two DIFFERENT formulas) -> not_checkable",
+        "def discovered_law(mass1, mass2, distance):\n    C = 6.674e-5\n    if distance == 0:\n        return C * mass1\n    else:\n        return C * (mass1 ** 2) * (mass2 ** 2) / (distance ** 2)",
         "HIDDEN_CONSTANT * (mass1 ** 2 * mass2 ** 2) / distance ** 2",
         "not_checkable",
     )
@@ -242,6 +273,12 @@ if __name__ == "__main__":
         "ground truth uses a bare symbol placeholder ('k') instead of HIDDEN_CONSTANT",
         "def discovered_law(x):\n    return x**2",
         "2 * k * x ** 2",
+        "constant_equivalent",
+    )
+    check(
+        "guard-if + try/except unwrapping (real m4_snell_law pattern)",
+        "def discovered_law(n1, n2, angle1):\n    import math\n    try:\n        cos_theta2 = (n1 / n2) * math.cos(math.radians(angle1))\n        if cos_theta2 < -1 or cos_theta2 > 1:\n            return float('nan')\n        theta2 = math.degrees(math.acos(cos_theta2))\n        return theta2\n    except ValueError:\n        return float('nan')",
+        "math.degrees(math.acos((n1 / n2) * math.cos(math.radians(angle1))))",
         "constant_equivalent",
     )
 
