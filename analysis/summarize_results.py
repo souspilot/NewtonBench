@@ -32,7 +32,7 @@ def read_models_from_file(models_file: Path) -> List[str]:
 
 def update_results(model_name, result_dir):
     """Update the results_by_trial.csv file with the latest trial results."""
-    csv_path = 'result_analysis/results_by_trial.csv'
+    csv_path = 'analysis/results_by_trial.csv'
 
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
@@ -172,7 +172,7 @@ def aggregate_results(output_csv, model_name=None):
     Main function to generate the aggregated results summary.
     """
     print("Loading all trial results into DataFrame...")
-    csv_path = 'result_analysis/results_by_trial.csv'
+    csv_path = 'analysis/results_by_trial.csv'
     if not os.path.exists(csv_path):
         print(f"{csv_path} not found.")
         return
@@ -292,7 +292,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process and aggregate all trial results into a summary CSV.")
     parser.add_argument("-m", "--model_name", default="all", help="LLMs to be processed")
     parser.add_argument("-d", "--result_dir", default="evaluation_results", help="Directory containing the evaluation results.")
-    parser.add_argument("-o", "--output_csv", default="result_analysis/aggregated_trial_summary.csv", help="Path to save the final aggregated CSV file.")
+    parser.add_argument("-o", "--output_csv", default="analysis/aggregated_trial_summary.csv", help="Path to save the final aggregated CSV file.")
     parser.add_argument("--models_file", type=str, default="configs/models.txt", help="Path to newline-delimited models list when --model_name is not given.")
     
     args = parser.parse_args()

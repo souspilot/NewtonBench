@@ -164,7 +164,7 @@ NewtonBench/
 │               └── {difficulty}/ # - Difficulty level
 │                   └── {version}/  # - Version
 │
-├── result_analysis/              # Scripts for analyzing results
+├── analysis/              # Scripts for analyzing results
 │   ├── summarize_results.py      # Main script to summarize results
 │   ├── results_by_trial.csv      # Intermediate CSV with raw trial data
 │   └── aggregated_trial_summary.csv    # Final aggregated summary
@@ -230,22 +230,22 @@ python run_master.py --parallel 8
 
 ### 📈 Analyzing Results
 
-After running experiments, you can use the `result_analysis/summarize_results.py` script to process and aggregate the results into a summary CSV file.
+After running experiments, you can use the `analysis/summarize_results.py` script to process and aggregate the results into a summary CSV file.
 
 The script performs two main functions in a single run:
-1.  **Consolidation**: It finds all individual trial `.json` files in the `evaluation_results` directory and compiles them into a single raw data file: `result_analysis/results_by_trial.csv`.
+1.  **Consolidation**: It finds all individual trial `.json` files in the `evaluation_results` directory and compiles them into a single raw data file: `analysis/results_by_trial.csv`.
 2.  **Aggregation**: It then processes `results_by_trial.csv`, performs statistical analysis (including outlier detection) and generates a final summary csv file named `aggregated_trial_summary.csv`.
 
 To generate the summary for all models listed in `configs/models.txt`, run:
 
 ```
-python result_analysis/summarize_results.py
+python analysis/summarize_results.py
 ```
 
 You can also generate the summary for a single model by specifying its name. For example:
 
 ```
-python result_analysis/summarize_results.py --model_name gpt41mini
+python analysis/summarize_results.py --model_name gpt41mini
 ```
 
 ## 🌟 Citation

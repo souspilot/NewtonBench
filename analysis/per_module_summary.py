@@ -2,7 +2,7 @@
 Per-module results summary, in the same shape as the paper's Appendix B.1
 per-domain tables (e.g. Figure 8 for Gravitation, Figure 10 for Magnetostatics).
 
-WHY THIS EXISTS: result_analysis/summarize_results.py's aggregate_results() only
+WHY THIS EXISTS: analysis/summarize_results.py's aggregate_results() only
 groups by (model_name, agent_backend) -- every module present in
 results_by_trial.csv gets pooled into a single acc_<difficulty>_<system> cell.
 That reproduces Table 2's shape (one row per model, averaged across all domains),
@@ -20,17 +20,17 @@ comparable to a single cell in the matching Appendix B.1 figure.
 
 Usage:
     # First, make sure results_by_trial.csv is up to date (same as summarize_results.py)
-    python result_analysis/summarize_results.py -m qwq-32b
+    python analysis/summarize_results.py -m qwq-32b
 
     # Then run this to get the per-module breakdown
-    python result_analysis/per_module_summary.py --model qwq-32b
+    python analysis/per_module_summary.py --model qwq-32b
 
     # Restrict to one module, or one backend
-    python result_analysis/per_module_summary.py --model qwq-32b --module m0_gravity
-    python result_analysis/per_module_summary.py --model qwq-32b --agent vanilla_agent
+    python analysis/per_module_summary.py --model qwq-32b --module m0_gravity
+    python analysis/per_module_summary.py --model qwq-32b --agent vanilla_agent
 
     # Only show cells your subset actually ran (skips all-N/A rows/columns)
-    python result_analysis/per_module_summary.py --model qwq-32b --subset_file configs/representative_subset.json
+    python analysis/per_module_summary.py --model qwq-32b --subset_file configs/representative_subset.json
 """
 import argparse
 import json
@@ -41,8 +41,8 @@ import numpy as np
 import pandas as pd
 
 # Reuse summarize_results.py's exact aggregation logic rather than reimplementing it.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "result_analysis"))
-from summarize_results import detect_outliers_modified_zscore_column, calculate_trial_stats  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
+from analysis.summarize_results import detect_outliers_modified_zscore_column, calculate_trial_stats  # noqa: E402
 
 DIFFICULTIES = ["easy", "medium", "hard"]
 SYSTEMS = ["vanilla_equation", "simple_system", "complex_system"]
@@ -54,7 +54,7 @@ def load_trials(csv_path: str, model: str) -> pd.DataFrame:
     df = df[df["model_name"] == model]
     if df.empty:
         raise SystemExit(f"No rows for model_name == '{model}' in {csv_path}. "
-                          f"Did you run result_analysis/summarize_results.py -m {model} first?")
+                          f"Did you run analysis/summarize_results.py -m {model} first?")
     return df
 
 
@@ -121,12 +121,12 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, help="model_name to summarize (matches the 'model_name' column in results_by_trial.csv)")
     parser.add_argument("--module", default=None, help="Restrict to one module (e.g. m0_gravity)")
     parser.add_argument("--agent", default=None, help="Restrict to one agent_backend (vanilla_agent / code_assisted_agent)")
-    parser.add_argument("--csv", default="result_analysis/results_by_trial.csv", help="Path to results_by_trial.csv")
+    parser.add_argument("--csv", default="analysis/results_by_trial.csv", help="Path to results_by_trial.csv")
     parser.add_argument("--subset_file", default=None,
                          help="Path to representative_subset.json -- when given, cells outside the subset "
                               "for a given module are marked '-' instead of 'N/A' (distinguishing 'not run "
                               "by design' from 'ran but produced no valid trials').")
-    parser.add_argument("-o", "--output_csv", default="result_analysis/per_module_summary.csv")
+    parser.add_argument("-o", "--output_csv", default="analysis/per_module_summary.csv")
     args = parser.parse_args()
 
     df = load_trials(args.csv, args.model)
