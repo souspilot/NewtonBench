@@ -166,7 +166,21 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
     df["structural_verdict"] = structural
 
     def bucket(row):
-        j, r = row["judge_verdict"], row["rmsle_verdict"]
+        j = row["judge_verdict"]
+        sv = row["structural_verdict"]
+        # Prefer the deterministic sympy check whenever it reached a verdict --
+        # it needs no arbitrary threshold. RMSLE-based rmsle_verdict is only
+        # trustworthy as a fallback for genuinely not_checkable trials (control
+        # flow etc.), since a fixed RMSLE threshold can't distinguish "exact"
+        # from "coincidentally close over the sampled domain but structurally
+        # wrong" (e.g. exponent 2.5 vs 2.6 barely diverging within the tested
+        # input range).
+        if sv == "constant_equivalent":
+            return "consistent_pass" if j else "judge_strict"
+        if sv == "structurally_different":
+            return "judge_lenient" if j else "consistent_fail"
+        # not_checkable: fall back to the RMSLE threshold, the only signal left.
+        r = row["rmsle_verdict"]
         if j and r:
             return "consistent_pass"
         if not j and not r:
@@ -180,8 +194,16 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
 
 def print_summary(df: pd.DataFrame, top_n: int):
     print(f"\nTotal unique trials analyzed: {len(df)}\n")
+    print("NOTE: agreement_bucket now trusts structural_verdict (deterministic, no threshold) "
+          "over rmsle_verdict whenever sympy reached a verdict. rmsle_verdict/--rmsle_threshold "
+          "only decide the bucket for not_checkable trials. This matters because a fixed RMSLE "
+          "threshold can't tell 'genuinely exact' apart from 'coincidentally close over the "
+          "sampled input domain but structurally wrong' (e.g. a wrong exponent that barely "
+          "diverges within the tested range) -- if you see a judge_strict/judge_lenient count "
+          "that seems too high, check whether it's dominated by not_checkable trials before "
+          "trusting it as evidence of judge unreliability.")
 
-    print("=== Agreement bucket counts ===")
+    print("\n=== Agreement bucket counts ===")
     print(df["agreement_bucket"].value_counts().to_string())
 
     print("\n=== judge_lenient trials, broken down by structural_verdict ===")
