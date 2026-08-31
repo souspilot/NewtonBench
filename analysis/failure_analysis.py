@@ -45,19 +45,34 @@ Usage:
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "result_analysis"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# summarize_results.py and structural_equivalence.py both live alongside this
+# script in analysis/ now, so a plain same-directory import works.
 from summarize_results import detect_outliers_modified_zscore_column  # noqa: E402
 from structural_equivalence import check_constant_equivalence  # noqa: E402
 
 DEFAULT_RMSLE_THRESHOLD = 1e-3  # well above float-precision noise (~1e-16), well below a
                                   # genuinely-wrong-constant trial's RMSLE (order 1+ in our examples)
+
+
+def _path_version(trial_path: Path) -> int:
+    """Extract the trailing _vN from a config directory
+    (e.g. '.../vanilla_equation_noise0_0_v2' -> 2), matching
+    summarize_results.py's extract_version_from_path. Re-runs of the same
+    logical config land in a new v2/v3/... directory (see get_experiment_path
+    in run_all_evaluations.py); this is how we tell "the current results" from
+    "a stale earlier attempt" for the SAME (module, difficulty, system,
+    law_version, agent_backend, trial_id).
+    """
+    config_dir = trial_path.parent.parent  # up from trials/
+    m = re.search(r"v(\d+)$", str(config_dir).rstrip("/"))
+    return int(m.group(1)) if m else 0
 
 
 def load_trials(result_dir: str, model: str) -> pd.DataFrame:
@@ -80,6 +95,7 @@ def load_trials(result_dir: str, model: str) -> pd.DataFrame:
             ev = data.get("evaluation", {}) or {}
             rows.append(dict(
                 path=str(trial_path),
+                path_version=_path_version(trial_path),
                 trial_id=data.get("trial_id"),
                 module=data.get("module_name"),
                 equation_difficulty=data.get("equation_difficulty"),
@@ -100,6 +116,24 @@ def load_trials(result_dir: str, model: str) -> pd.DataFrame:
         raise SystemExit(f"No trial files found under {model_dir}")
     df = pd.DataFrame(rows)
     df["rmsle"] = df["rmsle"].replace([np.inf, -np.inf], np.nan)
+
+    # De-duplicate exactly the way summarize_results.py's update_results() does:
+    # one row per (module, difficulty, system, law_version, agent_backend, trial_id),
+    # keeping only the highest-numbered config directory version. Without this,
+    # stale re-run directories (_v1, _v2, ... from earlier partial/aborted runs)
+    # get counted as if they were independent trials, silently inflating counts
+    # and double-weighting whatever happened to be re-run more often.
+    identity_cols = ["module", "equation_difficulty", "model_system", "law_version",
+                      "agent_backend", "trial_id"]
+    before = len(df)
+    df = (df.sort_values("path_version")
+            .drop_duplicates(subset=identity_cols, keep="last")
+            .reset_index(drop=True))
+    dropped = before - len(df)
+    if dropped:
+        print(f"Dropped {dropped} stale duplicate trial(s) from older re-run directories "
+              f"(kept the highest _vN version per logical config).")
+
     return df
 
 
@@ -144,8 +178,8 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
     return df
 
 
-def print_summary(df: pd.DataFrame):
-    print(f"\nTotal trials analyzed: {len(df)}\n")
+def print_summary(df: pd.DataFrame, top_n: int):
+    print(f"\nTotal unique trials analyzed: {len(df)}\n")
 
     print("=== Agreement bucket counts ===")
     print(df["agreement_bucket"].value_counts().to_string())
@@ -172,6 +206,30 @@ def print_summary(df: pd.DataFrame):
     print("\n=== Breakdown by module ===")
     print(pd.crosstab(df["module"], df["agreement_bucket"]).to_string())
 
+    # The genuinely actionable subset: judge_lenient trials where sympy says the
+    # forms are actually different (not just a constant mismatch) -- these are
+    # real judge errors, not benign "ignored the constant" cases.
+    concerning = lenient[lenient["structural_verdict"] == "structurally_different"].copy()
+    if not concerning.empty:
+        concerning["severity"] = concerning["rmsle"]
+        concerning = concerning.sort_values("severity", ascending=False)
+        print(f"\n=== Top {min(top_n, len(concerning))} most concerning judge errors "
+              f"(judge said equivalent, sympy disagrees, sorted by RMSLE) ===")
+        show_cols = ["module", "equation_difficulty", "model_system", "law_version",
+                     "agent_backend", "trial_id", "rmsle", "path"]
+        print(concerning[show_cols].head(top_n).to_string(index=False))
+    else:
+        print("\nNo structurally_different judge_lenient cases -- every judge_lenient trial is "
+              "explainable as a constant-fitting error, not a genuine judge mistake.")
+
+    if not strict.empty:
+        strict_sorted = strict.sort_values("rmsle")
+        print(f"\n=== Top {min(top_n, len(strict))} judge_strict trials (lowest RMSLE = most likely "
+              f"false negatives) ===")
+        show_cols = ["module", "equation_difficulty", "model_system", "law_version",
+                     "agent_backend", "trial_id", "rmsle", "structural_verdict", "path"]
+        print(strict_sorted[show_cols].head(top_n).to_string(index=False))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -180,8 +238,16 @@ if __name__ == "__main__":
     parser.add_argument("--module", default=None)
     parser.add_argument("--agent", default=None)
     parser.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
-    parser.add_argument("-o", "--output_csv", default="analysis/failure_analysis.csv")
+    parser.add_argument("--top", type=int, default=15, help="How many concerning trials to print in each ranked list")
+    parser.add_argument("--buckets", default="judge_lenient,judge_strict",
+                         help="Comma-separated agreement_bucket values to include in the exported CSV. "
+                              "Default excludes consistent_pass/consistent_fail (the expected, boring "
+                              "majority) so the CSV itself stays reviewable. Pass 'all' for everything.")
+    parser.add_argument("-o", "--output_csv", default=None,
+                         help="Default: analysis/failure_analysis_<model>.csv")
     args = parser.parse_args()
+
+    output_csv = args.output_csv or f"analysis/failure_analysis_{args.model}.csv"
 
     df = load_trials(args.result_dir, args.model)
     if args.module:
@@ -192,14 +258,21 @@ if __name__ == "__main__":
     df = clean_rmsle_outliers(df)
     df = compute_verdicts(df, args.rmsle_threshold)
 
-    print_summary(df)
+    print_summary(df, args.top)
 
-    Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
-    cols = ["path", "module", "equation_difficulty", "model_system", "law_version", "agent_backend",
-            "trial_id", "rmsle", "rmsle_cleaned", "exact_accuracy", "judge_verdict", "rmsle_verdict",
-            "structural_verdict", "agreement_bucket", "symbolic_msg", "submitted_law", "ground_truth_law"]
-    df[cols].to_csv(args.output_csv, index=False)
-    print(f"\nFull per-trial table written to {args.output_csv}")
+    if args.buckets.strip().lower() == "all":
+        export_df = df
+    else:
+        wanted = {b.strip() for b in args.buckets.split(",")}
+        export_df = df[df["agreement_bucket"].isin(wanted)]
+
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    cols = ["path", "path_version", "module", "equation_difficulty", "model_system", "law_version",
+            "agent_backend", "trial_id", "rmsle", "rmsle_cleaned", "exact_accuracy", "judge_verdict",
+            "rmsle_verdict", "structural_verdict", "agreement_bucket", "symbolic_msg", "submitted_law",
+            "ground_truth_law"]
+    export_df[cols].to_csv(output_csv, index=False)
+    print(f"\n{len(export_df)}/{len(df)} trials (buckets: {args.buckets}) written to {output_csv}")
     print("Sort/filter that CSV by agreement_bucket to pull up specific trials for manual review "
           "(the 'path' column points straight at the trial JSON, and 'submitted_law'/'ground_truth_law' "
           "are inlined so you often won't even need to open it).")

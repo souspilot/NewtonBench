@@ -40,8 +40,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Reuse summarize_results.py's exact aggregation logic rather than reimplementing it.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
+# summarize_results.py now lives alongside this script in analysis/, so a plain
+# same-directory import works (Python adds the running script's own directory
+# to sys.path automatically).
 from summarize_results import detect_outliers_modified_zscore_column, calculate_trial_stats  # noqa: E402
 
 DIFFICULTIES = ["easy", "medium", "hard"]
@@ -76,7 +77,7 @@ def load_subset_cells(subset_file: str):
     return {m: {(c["difficulty"], c["system"]) for c in cells} for m, cells in raw.items()}
 
 
-def build_table(df: pd.DataFrame, subset_cells) -> pd.DataFrame:
+def build_table(df: pd.DataFrame, subset_cells, model: str) -> pd.DataFrame:
     rows = []
     modules = sorted(df["module"].dropna().unique())
     backends = sorted(df["agent_backend"].dropna().unique())
@@ -88,7 +89,7 @@ def build_table(df: pd.DataFrame, subset_cells) -> pd.DataFrame:
                 continue
             allowed_cells = subset_cells.get(module) if subset_cells else None
 
-            row = {"module": module, "agent_backend": backend}
+            row = {"model": model, "module": module, "agent_backend": backend}
             for system in SYSTEMS:
                 for difficulty in DIFFICULTIES:
                     col = f"acc_{difficulty}_{system}"
@@ -112,7 +113,7 @@ def build_table(df: pd.DataFrame, subset_cells) -> pd.DataFrame:
 
     acc_cols = [f"acc_{d}_{s}" for s in SYSTEMS for d in DIFFICULTIES]
     rmsle_cols = [f"rmsle_{d}_{s}" for s in SYSTEMS for d in DIFFICULTIES]
-    col_order = ["module", "agent_backend"] + acc_cols + rmsle_cols + ["overall_acc", "overall_rmsle", "n_trials"]
+    col_order = ["model", "module", "agent_backend"] + acc_cols + rmsle_cols + ["overall_acc", "overall_rmsle", "n_trials"]
     return pd.DataFrame(rows).reindex(columns=col_order)
 
 
@@ -126,8 +127,11 @@ if __name__ == "__main__":
                          help="Path to representative_subset.json -- when given, cells outside the subset "
                               "for a given module are marked '-' instead of 'N/A' (distinguishing 'not run "
                               "by design' from 'ran but produced no valid trials').")
-    parser.add_argument("-o", "--output_csv", default="analysis/per_module_summary.csv")
+    parser.add_argument("-o", "--output_csv", default=None,
+                         help="Default: analysis/per_module_summary_<model>.csv")
     args = parser.parse_args()
+
+    output_csv = args.output_csv or f"analysis/per_module_summary_{args.model}.csv"
 
     df = load_trials(args.csv, args.model)
     if args.module:
@@ -141,12 +145,12 @@ if __name__ == "__main__":
 
     df = clean_rmsle_outliers(df)
     subset_cells = load_subset_cells(args.subset_file)
-    table = build_table(df, subset_cells)
+    table = build_table(df, subset_cells, args.model)
 
-    Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
-    table.to_csv(args.output_csv, index=False)
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    table.to_csv(output_csv, index=False)
 
     pd.set_option("display.width", 200)
     pd.set_option("display.max_columns", None)
     print(table.to_string(index=False))
-    print(f"\nWrote {args.output_csv}")
+    print(f"\nWrote {output_csv}")
