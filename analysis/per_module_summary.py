@@ -42,7 +42,7 @@ import pandas as pd
 
 # Reuse summarize_results.py's exact aggregation logic rather than reimplementing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "analysis"))
-from analysis.summarize_results import detect_outliers_modified_zscore_column, calculate_trial_stats  # noqa: E402
+from summarize_results import detect_outliers_modified_zscore_column, calculate_trial_stats  # noqa: E402
 
 DIFFICULTIES = ["easy", "medium", "hard"]
 SYSTEMS = ["vanilla_equation", "simple_system", "complex_system"]
