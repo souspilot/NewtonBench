@@ -56,6 +56,7 @@ api_source_mapping = {
     "qwq-32b": {"or": "qwen/qwq-32b", "oa": "qwq-32b"}, #development-LRM
     "qwen38-27b": {"oa": "qwen38-27b"},
     "sr-scientist": {"oa": "sr-scientist"},
+    "intern-s2": {"oa": "intern-s2"},
 
     "dsv3": {"or": "deepseek/deepseek-chat-v3-0324"}, #formal-LLM
     "dsr1": {"or": "deepseek/deepseek-r1-0528"}, #formal-LRM
