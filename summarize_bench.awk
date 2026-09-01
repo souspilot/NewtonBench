@@ -1,28 +1,3 @@
-# summarize_bench.awk
-#
-# Fix vs. the original: acc/rmsle/rounds/tokens/runtime/retries/failed were only
-# ever being SET (last-write-wins) inside each "BENCHMARK COMPLETED" block, but
-# each module run has 3 such blocks (one per law_version) before its one
-# "Total time" line. The original script's printed row therefore reflected only
-# whichever law_version happened to run last -- e.g. a module with law
-# versions scoring 100%/100%/0% could print "Acc: 0.00%" and look like a total
-# failure when it wasn't.
-#
-# This version accumulates every "BENCHMARK COMPLETED" block seen since the
-# last "Total time" line, then at "Total time" it AVERAGES the per-trial
-# metrics (acc, rmsle, rounds, tokens) across however many law-version blocks
-# were seen -- the natural aggregate, since each block is itself already an
-# average over that version's 4 trials, so this is equivalent to averaging
-# over all 12 trials -- and SUMS the block-level counters (runtime, retries,
-# failed), since those are genuinely additive across law versions rather than
-# things you'd want to average.
-#
-# If a module's "Total time" line fires with ZERO new BENCHMARK COMPLETED
-# blocks since the last reset (i.e. every one of its configs was already
-# complete from an earlier session and nothing new ran), the row prints
-# "ALREADY COMPLETE (no new trials this session)" instead of misleading
-# 0.00%/0.0000 values that would otherwise look like a real bad result.
-
 /Agent Backend:/ {
     backend = $NF
 }
