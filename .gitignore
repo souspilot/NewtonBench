@@ -2,6 +2,7 @@
 
 # Ignore the file containing secrets and environment variables
 .env
+env.sh
 
 # Ignore Python's cache and compiled files
 __pycache__/
@@ -11,6 +12,7 @@ __pycache__/
 evaluation_results/
 *.csv
 logs/
+*.log
 
 # Ignore macOS generated files
 .DS_Store?
