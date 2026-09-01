@@ -75,7 +75,17 @@ def _path_version(trial_path: Path) -> int:
     return int(m.group(1)) if m else 0
 
 
-def load_trials(result_dir: str, model: str) -> pd.DataFrame:
+def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.DataFrame:
+    """include_fails=False (default, matches this script's own use): skips
+    *_fail.json -- their stub "return float('nan')" submissions are noise for
+    structural mismatch classification. include_fails=True (used by
+    trajectory_analysis.py): keeps them, with is_fail=True and
+    exact_accuracy defaulted to 0.0 if not already present -- for a
+    resource-vs-outcome question, a trial that burned its full round budget
+    and still failed IS exactly the data point that matters, and silently
+    dropping it would bias any "did hitting the round limit correlate with
+    failure" analysis toward only the trials that finished cleanly.
+    """
     model_dir = Path(result_dir) / model
     if not model_dir.is_dir():
         raise SystemExit(f"No such directory: {model_dir}")
@@ -83,7 +93,8 @@ def load_trials(result_dir: str, model: str) -> pd.DataFrame:
     rows = []
     for trials_dir in model_dir.rglob("trials"):
         for trial_path in sorted(trials_dir.glob("trial*.json")):
-            if trial_path.name.endswith("_fail.json"):
+            is_fail = trial_path.name.endswith("_fail.json")
+            if is_fail and not include_fails:
                 continue
             try:
                 with open(trial_path) as f:
@@ -93,9 +104,14 @@ def load_trials(result_dir: str, model: str) -> pd.DataFrame:
                 continue
 
             ev = data.get("evaluation", {}) or {}
+            acc = ev.get("exact_accuracy")
+            if acc is None and is_fail:
+                acc = 0.0
             rows.append(dict(
                 path=str(trial_path),
                 path_version=_path_version(trial_path),
+                is_fail=is_fail,
+                status=data.get("status"),
                 trial_id=data.get("trial_id"),
                 module=data.get("module_name"),
                 equation_difficulty=data.get("equation_difficulty"),
@@ -103,7 +119,7 @@ def load_trials(result_dir: str, model: str) -> pd.DataFrame:
                 law_version=data.get("law_version"),
                 agent_backend=data.get("agent_backend"),
                 rmsle=ev.get("rmsle"),
-                exact_accuracy=ev.get("exact_accuracy"),
+                exact_accuracy=acc,
                 symbolic_equivalent=ev.get("symbolic_equivalent"),
                 symbolic_msg=ev.get("symbolic_msg"),
                 submitted_law=data.get("submitted_law"),
