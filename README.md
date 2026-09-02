@@ -256,6 +256,11 @@ python analysis/diagnostics.py verdicts --model gpt41mini --subset_file configs/
 python analysis/diagnostics.py all      --model gpt41mini --subset_file configs/representative_subset.json
 ```
 
+`verdicts` is the only subcommand that runs the (slow) sympy structural
+check; it caches the per-trial table, and `mistakes` / `trace` / `all` reuse
+it. Each sympy call is bounded by `--sympy_timeout` (default 20s) so a
+pathological expression can't hang the run.
+
 Pass `--subset_file` whenever a model's results directory mixes cell coverage
 from more than one run config. After `diagnostics.py verdicts` has run,
 `scoreboard.py --verified` shows the sympy-checked accuracy next to the raw
