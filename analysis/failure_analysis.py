@@ -183,14 +183,20 @@ def filter_to_subset(df: pd.DataFrame, subset_file: str) -> pd.DataFrame:
     cells = load_subset_cells(subset_file)
     if cells is None:
         return df
-    mask = df.apply(
-        lambda r: (r["equation_difficulty"], r["model_system"]) in cells.get(r["module"], set()),
-        axis=1,
-    )
+
+    allowed = {
+        (module, difficulty, system)
+        for module, module_cells in cells.items()
+        for (difficulty, system) in module_cells
+    }
+    idx = pd.MultiIndex.from_frame(df[["module", "equation_difficulty", "model_system"]])
+    mask = idx.isin(allowed)
+
     dropped = int((~mask).sum())
-    if dropped:
-        print(f"Subset filter ({subset_file}): kept {int(mask.sum())}/{len(df)} trials in "
-              f"whitelisted (module, difficulty, system) cells, dropped {dropped} out-of-subset.")
+    print(
+        f"Subset filter ({subset_file}): kept {int(mask.sum())}/{len(df)} trials in "
+        f"whitelisted (module, difficulty, system) cells, dropped {dropped} out-of-subset."
+    )
     return df[mask].reset_index(drop=True)
 
 
