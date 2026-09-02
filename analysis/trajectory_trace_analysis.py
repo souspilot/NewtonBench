@@ -56,7 +56,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from failure_analysis import (  # noqa: E402
-    load_trials, clean_rmsle_outliers, compute_verdicts, DEFAULT_RMSLE_THRESHOLD,
+    load_trials, clean_rmsle_outliers, compute_verdicts, filter_to_subset, DEFAULT_RMSLE_THRESHOLD,
 )
 
 _INVALID_MARKERS = (
@@ -248,6 +248,10 @@ def main():
     ap.add_argument("--agent", choices=["vanilla_agent", "code_assisted_agent"], default=None)
     ap.add_argument("--module", default=None)
     ap.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
+    ap.add_argument("--subset_file", default=None,
+                    help="Path to a representative_subset.json. Restricts analysis to its "
+                         "whitelisted (module, difficulty, system) cells -- use it when a model's "
+                         "results directory mixes cell coverage from more than one run config.")
     ap.add_argument("--dump-examples", default=None,
                     help="Print trial paths for a behaviour: had_format_failure, "
                          "no_parseable_law, or unverified_submit.")
@@ -257,6 +261,7 @@ def main():
     out_csv = args.output_csv or f"analysis/trajectory_trace_{args.model}.csv"
 
     df = load_trials(args.result_dir, args.model, include_fails=True)
+    df = filter_to_subset(df, args.subset_file)
     df = clean_rmsle_outliers(df)
     df = compute_verdicts(df, args.rmsle_threshold)
     df["verified_success"] = df["agreement_bucket"] == "consistent_pass"

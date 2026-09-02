@@ -48,7 +48,9 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from failure_analysis import load_trials, clean_rmsle_outliers, compute_verdicts, DEFAULT_RMSLE_THRESHOLD  # noqa: E402
+from failure_analysis import (  # noqa: E402
+    load_trials, clean_rmsle_outliers, compute_verdicts, filter_to_subset, DEFAULT_RMSLE_THRESHOLD,
+)
 
 MAX_TURNS = 10  # every module's system prompt states "up to 10 rounds"
 
@@ -166,6 +168,10 @@ def main():
                      help="Restrict to one agent backend. Omit to see both, plus a per-agent split.")
     ap.add_argument("--module", default=None, help="Restrict to one module, e.g. m5_radioactive_decay.")
     ap.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
+    ap.add_argument("--subset_file", default=None,
+                     help="Path to a representative_subset.json. Restricts analysis to its "
+                           "whitelisted (module, difficulty, system) cells -- use it when a model's "
+                           "results directory mixes cell coverage from more than one run config.")
     ap.add_argument("--success_metric", choices=["raw", "verified"], default="verified",
                      help="'verified' (default): judge AND sympy structural check both agree it's "
                            "correct -- filters out judge-lenient false credit. 'raw': the LLM judge's "
@@ -177,6 +183,7 @@ def main():
     output_csv = args.output_csv or f"analysis/trajectory_analysis_{args.model}.csv"
 
     df = load_trials(args.result_dir, args.model, include_fails=True)
+    df = filter_to_subset(df, args.subset_file)
     df = clean_rmsle_outliers(df)
     df = compute_verdicts(df, args.rmsle_threshold)
 
