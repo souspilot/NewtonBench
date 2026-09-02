@@ -155,9 +155,9 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
 
 def load_subset_cells(subset_file: str):
     """Return {module: {(difficulty, system), ...}} from a representative_subset.json
-    ({module: [{"difficulty": d, "system": s}, ...]}), or None if not given / not
-    found (meaning "no restriction"). Same shape as run_all_evaluations.py's and
-    per_module_summary.py's loaders.
+    ({module: [{"difficulty": d, "system": s}, ...]}), or None if not given.
+    Raises SystemExit if subset_file is provided but does not exist.
+    Same shape as run_all_evaluations.py's and per_module_summary.py's loaders.
     """
     if not subset_file:
         return None
