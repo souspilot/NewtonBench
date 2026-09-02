@@ -118,13 +118,21 @@ def _verified_line(df: pd.DataFrame, model: str):
         print(f"\n(no analysis/verdicts_{model}.csv -- run `diagnostics.py verdicts --model {model}` "
               f"for the sympy-checked number; SA above is raw judge accuracy and may be inflated)")
         return
+
     lab = labels[["path", "verified_success", "raw_success"]]
+    # Keep the verified stats consistent with the currently displayed df (e.g. subset_file filtering).
+    shown = set(df["path"].astype(str)) if "path" in df.columns else None
+    if shown is not None:
+        lab = lab[lab["path"].astype(str).isin(shown)].reset_index(drop=True)
+
     print(f"\n--- raw vs. verified SA (from verdicts_{model}.csv, n={len(lab)}) ---")
+    if lab.empty:
+        print("  (no overlapping trials between verdicts CSV and the currently displayed rows)")
+        return
     print(f"  raw judge SA      : {100*lab['raw_success'].mean():.1f}%")
     print(f"  sympy-verified SA : {100*lab['verified_success'].mean():.1f}%")
     flipped = int((lab["raw_success"] != lab["verified_success"]).sum())
     print(f"  {flipped} trials differ (judge-lenient credit / judge-strict misses)")
-
 
 def scoreboard(model: str, result_dir: str, subset_file: str, show_verified: bool, refresh: bool):
     if refresh:
