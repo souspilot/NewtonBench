@@ -121,6 +121,20 @@ def cmd_verdicts(args):
     print(lenient["structural_verdict"].value_counts().to_string() if len(lenient) else "(none)")
     print("  constant_equivalent = right form, wrong constant (arguably still deserves credit)")
     print("  structurally_different = genuine judge error; not_checkable = needs a human read")
+    if len(lenient):
+        # check_constant_equivalence's ratio simplify has false positives on trig/log
+        # identities: a numerically-exact fit that it calls structurally_different is
+        # almost always a sympy miss (really a pass), not a judge error.
+        likely_sympy_miss = int((lenient["rmsle"] < 1e-6).sum())
+        likely_judge_err = len(lenient) - likely_sympy_miss
+        base = int(df["verified_success"].sum())
+        n = len(df)
+        print(f"\n  of {len(lenient)} judge_lenient: ~{likely_sympy_miss} have RMSLE<1e-6 "
+              f"(numerically exact -> almost certainly a sympy-miss, really a pass), "
+              f"~{likely_judge_err} have RMSLE>=1e-6 (likely real judge error).")
+        print(f"  => verified SA {100*base/n:.1f}% is a LOWER bound; "
+              f"corrected band ~{100*base/n:.1f}-{100*(base+likely_sympy_miss)/n:.1f}%. "
+              f"Eyeball the RMSLE-sorted table below.")
 
     print("\n=== Breakdown by module ===")
     print(pd.crosstab(df["module"], df["agreement_bucket"]).to_string())
