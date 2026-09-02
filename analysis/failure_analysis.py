@@ -153,6 +153,53 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
     return df
 
 
+def load_subset_cells(subset_file: str):
+    """Return {module: {(difficulty, system), ...}} from a representative_subset.json
+    ({module: [{"difficulty": d, "system": s}, ...]}), or None if not given.
+    Raises SystemExit if subset_file is provided but does not exist.
+    Same shape as run_all_evaluations.py's and per_module_summary.py's loaders.
+    """
+    if not subset_file:
+        return None
+    p = Path(subset_file)
+    if not p.exists():
+        raise SystemExit(f"--subset_file not found: {subset_file}")
+    with open(p) as f:
+        raw = json.load(f)
+    return {m: {(c["difficulty"], c["system"]) for c in cells} for m, cells in raw.items()}
+
+
+def filter_to_subset(df: pd.DataFrame, subset_file: str) -> pd.DataFrame:
+    """Keep only trials whose (module, equation_difficulty, model_system) is a
+    whitelisted cell in subset_file. No-op when subset_file is None.
+
+    Why this exists: load_trials() reads EVERY trial JSON on disk for a model.
+    If a run's config was changed mid-flight (e.g. representative_subset_big.json
+    -> representative_subset.json), the model's directory ends up with a mix of
+    cell coverage, and any per-difficulty / per-cell aggregate silently pools
+    trials from configs that were never meant to be compared. Passing the
+    current subset file pins every analysis to the same cell set.
+    """
+    cells = load_subset_cells(subset_file)
+    if cells is None:
+        return df
+
+    allowed = {
+        (module, difficulty, system)
+        for module, module_cells in cells.items()
+        for (difficulty, system) in module_cells
+    }
+    idx = pd.MultiIndex.from_frame(df[["module", "equation_difficulty", "model_system"]])
+    mask = idx.isin(allowed)
+
+    dropped = int((~mask).sum())
+    print(
+        f"Subset filter ({subset_file}): kept {int(mask.sum())}/{len(df)} trials in "
+        f"whitelisted (module, difficulty, system) cells, dropped {dropped} out-of-subset."
+    )
+    return df[mask].reset_index(drop=True)
+
+
 def clean_rmsle_outliers(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["rmsle_cleaned"] = df["rmsle"]
@@ -276,6 +323,11 @@ if __name__ == "__main__":
     parser.add_argument("--module", default=None)
     parser.add_argument("--agent", default=None)
     parser.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
+    parser.add_argument("--subset_file", default=None,
+                         help="Path to a representative_subset.json. Restricts analysis to its "
+                              "whitelisted (module, difficulty, system) cells -- use it when a "
+                              "model's results directory mixes cell coverage from more than one "
+                              "run config.")
     parser.add_argument("--top", type=int, default=15, help="How many concerning trials to print in each ranked list")
     parser.add_argument("--buckets", default="judge_lenient,judge_strict",
                          help="Comma-separated agreement_bucket values to include in the exported CSV. "
@@ -288,6 +340,7 @@ if __name__ == "__main__":
     output_csv = args.output_csv or f"analysis/failure_analysis_{args.model}.csv"
 
     df = load_trials(args.result_dir, args.model)
+    df = filter_to_subset(df, args.subset_file)
     if args.module:
         df = df[df["module"] == args.module]
     if args.agent:

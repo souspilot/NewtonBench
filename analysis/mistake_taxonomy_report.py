@@ -31,7 +31,9 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from failure_analysis import load_trials, clean_rmsle_outliers, compute_verdicts, DEFAULT_RMSLE_THRESHOLD  # noqa: E402
+from failure_analysis import (  # noqa: E402
+    load_trials, clean_rmsle_outliers, compute_verdicts, filter_to_subset, DEFAULT_RMSLE_THRESHOLD,
+)
 from mismatch_classifier import classify_mismatch  # noqa: E402
 
 MISTAKE_TYPE_ORDER = ["missing_variable", "sign_flip", "extra_variable", "wrong_exponent",
@@ -115,6 +117,11 @@ if __name__ == "__main__":
     parser.add_argument("--module", default=None)
     parser.add_argument("--agent", default=None)
     parser.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
+    parser.add_argument("--subset_file", default=None,
+                         help="Path to a representative_subset.json. Restricts analysis to its "
+                              "whitelisted (module, difficulty, system) cells -- use it when a "
+                              "model's results directory mixes cell coverage from more than one "
+                              "run config.")
     parser.add_argument("--samples", type=int, default=8, help="Examples to sample per mistake type (5-10 typical)")
     parser.add_argument("-o", "--output_csv", default=None,
                          help="Default: analysis/mistake_taxonomy_<model>.csv (full table, not just samples)")
@@ -123,6 +130,7 @@ if __name__ == "__main__":
     output_csv = args.output_csv or f"analysis/mistake_taxonomy_{args.model}.csv"
 
     df = load_trials(args.result_dir, args.model)
+    df = filter_to_subset(df, args.subset_file)
     if args.module:
         df = df[df["module"] == args.module]
     if args.agent:
