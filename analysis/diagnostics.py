@@ -372,10 +372,20 @@ def _trace_report(df, label, example_sink):
 
 def cmd_trace(args):
     df = prepared_frame(args, include_fails=True)
-    traces = pd.DataFrame(
-        [{"path": p, **analyse_trace(json.load(open(p)).get("chat_history", []))}
-         if os.path.exists(p) else {"path": p} for p in df["path"]]
-    )
+
+    recs = []
+    for p in df["path"]:
+        if not os.path.exists(p):
+            recs.append({"path": p})
+            continue
+        try:
+            with open(p) as f:
+                recs.append({"path": p, **analyse_trace(json.load(f).get("chat_history", []))})
+        except Exception as e:  # noqa: BLE001
+            print(f"  (skipped {p}: {e})")
+            recs.append({"path": p})
+
+    traces = pd.DataFrame(recs)
     merged = df.merge(traces, on="path", how="left")
 
     examples = {}
