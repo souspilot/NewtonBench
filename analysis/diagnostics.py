@@ -42,32 +42,15 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from newton_common import (  # noqa: E402
-    load_trials, filter_to_subset, clean_rmsle_outliers, compute_verdicts,
-    verdicts_csv_path, analysis_path, DEFAULT_RMSLE_THRESHOLD, MAX_TURNS,
+    load_trials, filter_to_subset, clean_rmsle_outliers, compute_verdicts, time_limit,
+    verdicts_csv_path, load_verified_labels, analysis_path,
+    DEFAULT_RMSLE_THRESHOLD, DEFAULT_SYMPY_TIMEOUT, MAX_TURNS,
     MODULE_SHORT, SYS_SHORT, AGENT_SHORT, MODULE_ORDER, DIFFICULTIES, SYSTEMS,
 )
 
 
 # ===========================================================================
 # shared frame prep
-# ===========================================================================
-
-def prepared_frame(args, include_fails: bool) -> pd.DataFrame:
-    df = load_trials(args.result_dir, args.model, include_fails=include_fails)
-    df = filter_to_subset(df, args.subset_file)
-    if args.module:
-        df = df[df["module"] == args.module].reset_index(drop=True)
-    if args.agent:
-        df = df[df["agent_backend"] == args.agent].reset_index(drop=True)
-    if df.empty:
-        raise SystemExit("No trials match the given filters.")
-    df = clean_rmsle_outliers(df)
-    df = compute_verdicts(df, args.rmsle_threshold)
-    return df
-
-
-# ===========================================================================
-# verdicts
 # ===========================================================================
 
 VERDICT_COLS = ["path", "module", "equation_difficulty", "model_system", "law_version",
@@ -77,8 +60,47 @@ VERDICT_COLS = ["path", "module", "equation_difficulty", "model_system", "law_ve
                 "symbolic_msg", "submitted_law", "ground_truth_law"]
 
 
+def _load_filtered(args, include_fails: bool) -> pd.DataFrame:
+    df = load_trials(args.result_dir, args.model, include_fails=include_fails)
+    df = filter_to_subset(df, args.subset_file)
+    if args.module:
+        df = df[df["module"] == args.module].reset_index(drop=True)
+    if args.agent:
+        df = df[df["agent_backend"] == args.agent].reset_index(drop=True)
+    if df.empty:
+        raise SystemExit("No trials match the given filters.")
+    return clean_rmsle_outliers(df)
+
+
+def compute_and_write_verdicts(args) -> pd.DataFrame:
+    """The one expensive sympy pass. `verdicts` calls it directly; `mistakes`
+    and `trace` go through verdict_frame() which reuses the written CSV."""
+    df = compute_verdicts(_load_filtered(args, include_fails=True),
+                          args.rmsle_threshold, getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT))
+    out = verdicts_csv_path(args.model)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    df[[c for c in VERDICT_COLS if c in df.columns]].to_csv(out, index=False)
+    return df
+
+
+def verdict_frame(args) -> pd.DataFrame:
+    """Per-trial verdict table for `mistakes` / `trace`: reuse verdicts_<model>.csv
+    if it exists and still covers every filtered trial, else run (and cache) the
+    sympy pass. Avoids paying for structural checks 3x in `all`."""
+    cached = load_verified_labels(args.model)
+    if cached is not None:
+        want = _load_filtered(args, include_fails=True)
+        merged = want.drop(columns=[c for c in cached.columns if c != "path" and c in want.columns]) \
+                     .merge(cached, on="path", how="left")
+        if merged["agreement_bucket"].notna().all():
+            print(f"(reusing {verdicts_csv_path(args.model)} -- run `diagnostics.py verdicts` to refresh)")
+            return merged
+        print("(verdicts_<model>.csv is stale / missing rows -- recomputing)")
+    return compute_and_write_verdicts(args)
+
+
 def cmd_verdicts(args):
-    df = prepared_frame(args, include_fails=True)
+    df = compute_and_write_verdicts(args)
 
     print(f"\n{'='*70}\nVerdicts: {args.model}   (n={len(df)})\n{'='*70}")
     print("agreement_bucket trusts the deterministic sympy structural check whenever it "
@@ -99,6 +121,20 @@ def cmd_verdicts(args):
     print(lenient["structural_verdict"].value_counts().to_string() if len(lenient) else "(none)")
     print("  constant_equivalent = right form, wrong constant (arguably still deserves credit)")
     print("  structurally_different = genuine judge error; not_checkable = needs a human read")
+    if len(lenient):
+        # check_constant_equivalence's ratio simplify has false positives on trig/log
+        # identities: a numerically-exact fit that it calls structurally_different is
+        # almost always a sympy miss (really a pass), not a judge error.
+        likely_sympy_miss = int((lenient["rmsle"] < 1e-6).sum())
+        likely_judge_err = len(lenient) - likely_sympy_miss
+        base = int(df["verified_success"].sum())
+        n = len(df)
+        print(f"\n  of {len(lenient)} judge_lenient: ~{likely_sympy_miss} have RMSLE<1e-6 "
+              f"(numerically exact -> almost certainly a sympy-miss, really a pass), "
+              f"~{likely_judge_err} have RMSLE>=1e-6 (likely real judge error).")
+        print(f"  => verified SA {100*base/n:.1f}% is a LOWER bound; "
+              f"corrected band ~{100*base/n:.1f}-{100*(base+likely_sympy_miss)/n:.1f}%. "
+              f"Eyeball the RMSLE-sorted table below.")
 
     print("\n=== Breakdown by module ===")
     print(pd.crosstab(df["module"], df["agreement_bucket"]).to_string())
@@ -115,10 +151,8 @@ def cmd_verdicts(args):
         print(f"\n=== Top {min(args.top, len(strict))} judge_strict (lowest RMSLE = likely false negative) ===")
         print(strict.sort_values("rmsle")[show + ["structural_verdict"]].head(args.top).to_string(index=False))
 
-    out = verdicts_csv_path(args.model)
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    df[[c for c in VERDICT_COLS if c in df.columns]].to_csv(out, index=False)
-    print(f"\nPer-trial verified_success labels written to {out} (scoreboard.py --verified reads this).")
+    print(f"\nPer-trial verified_success labels written to {verdicts_csv_path(args.model)} "
+          f"(scoreboard.py --verified and the other subcommands read this).")
 
 
 # ===========================================================================
@@ -141,23 +175,34 @@ MISTAKE_BLURB = {
 def cmd_mistakes(args):
     from mismatch_classifier import classify_mismatch
 
-    df = prepared_frame(args, include_fails=False)
+    df = verdict_frame(args)
     fails = df[df["agreement_bucket"] == "consistent_fail"].copy()
     if fails.empty:
         raise SystemExit("No consistent_fail trials -- nothing to classify.")
 
-    types, details = [], []
-    for _, row in fails.iterrows():
-        if not isinstance(row["submitted_law"], str) or not isinstance(row["ground_truth_law"], str):
-            types.append("not_checkable")
-            details.append("")
+    # classify once per unique (submitted, ground_truth) pair, each call time-limited
+    # (mismatch_classifier's sp.simplify can hang on nested exp/log/power forms).
+    timeout = getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT)
+    cache, n_timeout = {}, 0
+    for sub, gt in fails[["submitted_law", "ground_truth_law"]].drop_duplicates().itertuples(index=False):
+        if not isinstance(sub, str) or not isinstance(gt, str):
+            cache[(sub, gt)] = ("not_checkable", "")
             continue
-        res = classify_mismatch(row["submitted_law"], row["ground_truth_law"])
-        types.append(res["mistake_type"])
-        details.append("; ".join(f"{p}: sub={d['sub']}, gt={d['gt']} ({d['issue']})"
-                                 for p, d in res["details"].items() if d["issue"] != "matches"))
-    fails["mistake_type"] = types
-    fails["mistake_detail"] = details
+        try:
+            with time_limit(timeout):
+                res = classify_mismatch(sub, gt)
+            cache[(sub, gt)] = (res["mistake_type"],
+                                "; ".join(f"{p}: sub={d['sub']}, gt={d['gt']} ({d['issue']})"
+                                          for p, d in res["details"].items() if d["issue"] != "matches"))
+        except Exception:  # noqa: BLE001  (TimeoutError included)
+            cache[(sub, gt)] = ("not_checkable", "")
+            n_timeout += 1
+    if n_timeout:
+        print(f"  ({n_timeout} law pair(s) hit the {timeout}s classify timeout -> not_checkable)")
+    fails["mistake_type"] = [cache.get((s, g), ("not_checkable", ""))[0]
+                             for s, g in zip(fails["submitted_law"], fails["ground_truth_law"])]
+    fails["mistake_detail"] = [cache.get((s, g), ("not_checkable", ""))[1]
+                               for s, g in zip(fails["submitted_law"], fails["ground_truth_law"])]
 
     print(f"\n{'='*70}\nMistake taxonomy: {args.model}   ({len(fails)} genuinely-wrong trials)\n{'='*70}")
     counts = fails["mistake_type"].value_counts()
@@ -371,7 +416,7 @@ def _trace_report(df, label, example_sink):
 
 
 def cmd_trace(args):
-    df = prepared_frame(args, include_fails=True)
+    df = verdict_frame(args)
 
     recs = []
     for p in df["path"]:
@@ -540,6 +585,9 @@ def main():
                        default=None)
         p.add_argument("--module", default=None)
         p.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
+        p.add_argument("--sympy_timeout", type=float, default=DEFAULT_SYMPY_TIMEOUT,
+                       help="seconds per unique law pair before the structural / classify "
+                            "check bails to not_checkable (0 disables)")
         p.add_argument("--top", type=int, default=15)
         if name in ("mistakes", "all"):
             p.add_argument("--samples", type=int, default=8)

@@ -22,11 +22,38 @@ module does NOT pull in sympy: scoreboard.py stays sympy-free.
 import json
 import os
 import re
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
+
+
+@contextmanager
+def time_limit(seconds: float):
+    """Abort the wrapped block after `seconds` (raises TimeoutError). No-op when
+    SIGALRM is unavailable (non-Unix) or seconds <= 0. Guards the sympy calls in
+    compute_verdicts / classify_mismatch, some of which -- sp.simplify on nested
+    exp/log/power expressions -- can otherwise run effectively forever."""
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handler(_signum, _frame):
+        raise TimeoutError(f"exceeded {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+DEFAULT_SYMPY_TIMEOUT = 20.0  # seconds per unique law pair
 
 DEFAULT_RMSLE_THRESHOLD = 1e-3
 MAX_TURNS = 10  # every module's system prompt states "up to 10 rounds"
@@ -223,13 +250,18 @@ def clean_rmsle_outliers(df: pd.DataFrame) -> pd.DataFrame:
 # (lazy sympy import keeps scoreboard.py sympy-free)
 # ---------------------------------------------------------------------------
 
-def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
+def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
+                     sympy_timeout: float = DEFAULT_SYMPY_TIMEOUT) -> pd.DataFrame:
     """Add judge_verdict / rmsle_verdict / structural_verdict / agreement_bucket.
 
     agreement_bucket trusts the deterministic sympy structural check whenever
     it reached a verdict; the RMSLE threshold only decides not_checkable rows.
     Buckets: consistent_pass, consistent_fail, judge_lenient (judge says
     equivalent, sympy disagrees), judge_strict (judge says wrong, fit is exact).
+
+    The structural check is run once per UNIQUE (submitted_law, ground_truth_law)
+    pair (trials re-run the same config, so pairs repeat a lot) and each call is
+    wrapped in time_limit(sympy_timeout) -> 'not_checkable' on a hang.
     """
     from structural_equivalence import check_constant_equivalence  # lazy: pulls sympy
 
@@ -237,13 +269,23 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float) -> pd.DataFrame:
     df["judge_verdict"] = df["symbolic_equivalent"].fillna(False).astype(bool)
     df["rmsle_verdict"] = df["rmsle"] < rmsle_threshold
 
-    structural = []
-    for _, row in df.iterrows():
-        if not isinstance(row["submitted_law"], str) or not isinstance(row["ground_truth_law"], str):
-            structural.append("not_checkable")
+    pairs = {}
+    uniq = df[["submitted_law", "ground_truth_law"]].drop_duplicates()
+    n_timeout = 0
+    for sub, gt in uniq.itertuples(index=False):
+        if not isinstance(sub, str) or not isinstance(gt, str):
+            pairs[(sub, gt)] = "not_checkable"
             continue
-        structural.append(check_constant_equivalence(row["submitted_law"], row["ground_truth_law"]))
-    df["structural_verdict"] = structural
+        try:
+            with time_limit(sympy_timeout):
+                pairs[(sub, gt)] = check_constant_equivalence(sub, gt)
+        except Exception:  # noqa: BLE001  (TimeoutError included)
+            pairs[(sub, gt)] = "not_checkable"
+            n_timeout += 1
+    if n_timeout:
+        print(f"  ({n_timeout} law pair(s) hit the {sympy_timeout}s sympy timeout -> not_checkable)")
+    df["structural_verdict"] = [pairs.get((s, g), "not_checkable")
+                                for s, g in zip(df["submitted_law"], df["ground_truth_law"])]
 
     def bucket(row):
         j = row["judge_verdict"]
