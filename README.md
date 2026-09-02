@@ -164,10 +164,11 @@ NewtonBench/
 │               └── {difficulty}/ # - Difficulty level
 │                   └── {version}/  # - Version
 │
-├── result_analysis/              # Scripts for analyzing results
-│   ├── summarize_results.py      # Main script to summarize results
-│   ├── results_by_trial.csv      # Intermediate CSV with raw trial data
-│   └── aggregated_trial_summary.csv    # Final aggregated summary
+├── analysis/                     # Scripts for analyzing results
+│   ├── scoreboard.py             # Fast: headline symbolic-accuracy numbers
+│   ├── diagnostics.py            # Slow: verdicts / mistakes / trace / agents deep-dive
+│   ├── rejudge.py                # Re-run the LLM judge over existing trials
+│   └── results_by_trial.csv      # Intermediate CSV (built by scoreboard.py)
 │
 ├── quick_start.py                # Quick start demo script
 ├── run_master.py                 # Main experiment runner
@@ -230,23 +231,35 @@ python run_master.py --parallel 8
 
 ### 📈 Analyzing Results
 
-After running experiments, you can use the `result_analysis/summarize_results.py` script to process and aggregate the results into a summary CSV file.
+There are two analysis entry points, split by cost:
 
-The script performs two main functions in a single run:
-1.  **Consolidation**: It finds all individual trial `.json` files in the `evaluation_results` directory and compiles them into a single raw data file: `result_analysis/results_by_trial.csv`.
-2.  **Aggregation**: It then processes `results_by_trial.csv`, performs statistical analysis (including outlier detection) and generates a final summary csv file named `aggregated_trial_summary.csv`.
-
-To generate the summary for all models listed in `configs/models.txt`, run:
-
-```
-python result_analysis/summarize_results.py
-```
-
-You can also generate the summary for a single model by specifying its name. For example:
+**`analysis/scoreboard.py`** — fast. Rescans the trial `.json` files under
+`evaluation_results/` into `analysis/results_by_trial.csv`, then prints
+symbolic accuracy by (system × difficulty) cell, by module, and by agent,
+plus coverage and a token/rounds/experiments quick-look. No sympy.
 
 ```
-python result_analysis/summarize_results.py --model_name gpt41mini
+python analysis/scoreboard.py --model gpt41mini
+python analysis/scoreboard.py --all                                   # every model in configs/models.txt
+python analysis/scoreboard.py --model gpt41mini --subset_file configs/representative_subset.json
 ```
+
+**`analysis/diagnostics.py`** — slow (sympy + full transcript parsing).
+Subcommands: `verdicts` (judge vs. deterministic-sympy vs. RMSLE agreement —
+catches judge-inflated accuracy, and writes `analysis/verdicts_<model>.csv`),
+`mistakes` (classify *how* wrong laws are wrong, with examples), `trace`
+(chat-history mining: reasoning blowup, format failures, hypothesis churn,
+resource-vs-outcome), `agents` (agent A/B + divergence cases), and `all`.
+
+```
+python analysis/diagnostics.py verdicts --model gpt41mini --subset_file configs/representative_subset.json
+python analysis/diagnostics.py all      --model gpt41mini --subset_file configs/representative_subset.json
+```
+
+Pass `--subset_file` whenever a model's results directory mixes cell coverage
+from more than one run config. After `diagnostics.py verdicts` has run,
+`scoreboard.py --verified` shows the sympy-checked accuracy next to the raw
+number.
 
 ## 🌟 Citation
 
