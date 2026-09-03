@@ -123,7 +123,7 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
     for turn in range(max_turns):
         messages, tokens, response_text = _call_llm_and_process_response(messages, model_name, trial_info)
         total_tokens += tokens
-        print(f"[Trial {trial_info.get('trial_id', '?') if trial_info else '?'}] Round {turn+1} tokens: {tokens}")
+        print(f"[Trial {trial_info.get('trial_id', '?') if trial_info else '?'}] Round {turn+1} tokens: {tokens}", flush=True)
 
         # Check for final law submission
         is_submitted, submitted_law = _extract_final_law(response_text, module.FUNCTION_SIGNATURE)
