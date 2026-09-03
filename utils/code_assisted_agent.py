@@ -102,6 +102,7 @@ def conduct_code_assisted_exploration(
                     raise ValueError(f"Unexpected return format from call_llm_api: {len(api_result)} values")
                 
                 total_tokens += tokens
+                print(f"[Code Assisted Trial {trial_id}] Turn {turn + 1} tokens: {tokens} (running total: {total_tokens})")
 
                 if response is None:
                     response = ""
@@ -250,6 +251,7 @@ def conduct_code_assisted_exploration(
                 raise ValueError(f"Unexpected return format from call_llm_api: {len(api_result)} values")
 
             total_tokens += tokens
+            print(f"[Code Assisted Trial {trial_id}] Final submission tokens: {tokens} (running total: {total_tokens})")
 
             if reasoning_content and reasoning_content.strip():
                 combined_content = f"**Reasoning Process:**\n{reasoning_content}\n\n**Main Response:**\n{response}"
