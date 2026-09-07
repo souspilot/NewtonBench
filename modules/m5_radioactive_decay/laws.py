@@ -26,7 +26,7 @@ def _ground_truth_law_easy_v1(N0: float, lambda_constant: float, t: float) -> fl
         return float('nan')
 
 def _ground_truth_law_easy_v2(N0: float, lambda_constant: float, t: float) -> float:
-    """Easy radioactive decay law: N(t) = N₀ * e^(-(λ * t)^0.5)"""
+    """Easy radioactive decay law: N(t) = N₀ * e^(-(λ * t)^1.5)"""
     try:
         with np.errstate(over='raise', divide='raise', invalid='raise', under='ignore'):
             value = N0 * np.exp(-(lambda_constant * t) ** 1.5)

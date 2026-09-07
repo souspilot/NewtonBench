@@ -41,14 +41,14 @@ def get_law_versions_for_difficulty(module_name, difficulty):
 # cell's reported value is always a multiple of 1/12 (e.g. 91.7% = 11/12). Running
 # fewer than 3 versions for a cell can never reproduce that resolution, so this
 # subset does NOT thin versions or trials within a cell it runs. Instead it thins
-# which CELLS get run: for each of the 12 modules, only 2 of its 9 (difficulty,
-# system) cells are run, but those 2 are run at FULL fidelity (all 3 versions x 4
-# trials), making their numbers directly comparable to the corresponding entries
+# which CELLS get run: for each of the 12 modules, only 1 of its 9 (difficulty,
+# system) cells are run, but that cell is run at FULL fidelity (all 3 versions x 4
+# trials), making its numbers directly comparable to the corresponding entries
 # in Appendix B.1. trials_per_law is left at the paper's default (4) regardless of
 # subsetting -- deliberately NOT reduced, so each configuration keeps full retry
 # slack in case a trial fails.
 #
-# 12 modules x 2 cells x 3 versions = 72 configurations, x 4 trials/law = 288
+# 12 modules x 1 cell x 3 versions = 36 configurations, x 4 trials/law = 144
 # total trials per (model, agent_backend), vs. 324 configs / 1,296 trials full.
 DEFAULT_SUBSET_FILE = os.path.join('configs', 'representative_subset.json')
 DEFAULT_TRIALS = 4
@@ -206,8 +206,10 @@ def count_total_configurations(modules: List[str], difficulties: List[str], syst
 
 def generate_progress_report(completed: int, skipped: int, partial: int, failed: int, total: int) -> str:
     """Generate progress statistics report."""
+    if total == 0:
+        return "\nNo configurations to run for this filter combination.\n"
     remaining = total - completed - skipped - partial - failed
-    
+
     report = f"\n{'='*60}\n"
     report += "EXPERIMENT PROGRESS SUMMARY\n"
     report += f"{'='*60}\n"
@@ -218,7 +220,7 @@ def generate_progress_report(completed: int, skipped: int, partial: int, failed:
     report += f"⏳ Remaining:     {remaining:4d} configurations ({remaining/total*100:5.1f}%)\n"
     report += f"📊 Total:         {total:4d} configurations\n"
     report += f"{'='*60}\n"
-    
+
     return report
 
 def parse_noise_levels(noise_str: str) -> List[float]:

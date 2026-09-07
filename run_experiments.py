@@ -451,7 +451,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     print("-"*50)      
     print(f"  - Retry Statistics:")
     print(f"    * Total Retry Attempts: {total_retries}")
-    print(f"    * Trials with Retries: {trials_with_retries}/{len(all_results)} ({trials_with_retries/len(all_results)*100:.1f}%)")
+    print(f"    * Trials with Retries: {trials_with_retries}/{len(all_results)} ({trials_with_retries/len(all_results)*100:.1f}%)" if all_results else "    * Trials with Retries: 0/0")
     print(f"    * Average Retries per Trial: {np.mean(all_retry_attempts):.2f}")
     print(f"    * Failed Trials (after all retries): {len(failed_results)}")
     if budget_stats:
@@ -496,7 +496,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
             "retry_statistics": {
                 "total_retry_attempts": total_retries,
                 "trials_with_retries": trials_with_retries,
-                "trials_with_retries_percentage": float(trials_with_retries/len(all_results)*100),
+                "trials_with_retries_percentage": float(trials_with_retries/len(all_results)*100) if all_results else 0.0,
                 "average_retries_per_trial": float(np.mean(all_retry_attempts)),
                 "failed_trials_after_retries": len(failed_results)
             },

@@ -193,7 +193,7 @@ class CodeExecutorBase:
             'python_code': python_code
         }
     
-    def format_execution_feedback(self, processing_result: Dict[str, Any], max_tool_calls: int = 3) -> str:
+    def format_execution_feedback(self, processing_result: Dict[str, Any], max_tool_calls: int = 1) -> str:
         """
         Format execution results for LLM consumption.
         

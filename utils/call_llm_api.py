@@ -193,7 +193,7 @@ def call_llm_api(messages, model_name, keys=keys, temperature=0.4, trial_info=No
                 "messages": messages,
                 "temperature": temperature,
             }
-            if model_name == "dsv31":
+            if model_name == "dsv3":
                 params["reasoning"] = {"enabled": True} 
 
             response = requests.post(
