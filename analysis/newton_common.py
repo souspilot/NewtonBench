@@ -267,6 +267,8 @@ def detect_outliers_modified_zscore_column(df, column_name, threshold=3.5):
     if len(data) == 0:
         return df
     data_for_stats = np.where(np.isinf(data), np.nan, data)
+    if np.all(np.isnan(data_for_stats)):
+        return df
     median = np.nanmedian(data_for_stats)
     mad = np.nanmedian(np.abs(data_for_stats - median))
     if mad == 0:
