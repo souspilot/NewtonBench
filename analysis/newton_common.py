@@ -468,10 +468,15 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
 
 
 def calculate_trial_stats(df):
-    """Mean/std of per-trial-id mean accuracy & rmsle (the paper's trial-then-mean)."""
+    """Mean/std of per-trial mean accuracy & rmsle (the paper's trial-then-mean)."""
     if df.empty:
         return np.nan, np.nan, np.nan, np.nan
-    trial_means = df.groupby("trial_id").agg(
+    group_cols = [c for c in ["module", "equation_difficulty", "model_system",
+                              "law_version", "agent_backend", "trial_id"]
+                  if c in df.columns]
+    if not group_cols:
+        group_cols = ["trial_id"]
+    trial_means = df.groupby(group_cols).agg(
         mean_accuracy=("exact_accuracy", "mean"),
         mean_rmsle=("rmsle", "mean"),
     ).dropna()
