@@ -256,13 +256,15 @@ to restore the old unbounded behaviour.
 
 All cost values live in **`configs/budget/budget.json`** (per-module overrides
 supported) — no prompt text or experiment code needs editing. Budgeted runs are
-written to a separate tree (`budget_evaluation_results/` by default); score them
-with `--result_dir budget_evaluation_results`. See
+written to a separate tree (`budget_evaluation_results/` by default). The analysis
+scripts take the same `--budget` flag: it points them at that tree, keeps their
+CSVs separate, and adds spend / funds-remaining / overspent reporting. See
 [`configs/budget/README.md`](configs/budget/README.md).
 
 ```
-python run_experiments.py --module m11_heat_transfer --model_name gpt41mini --budget
-python analysis/scoreboard.py --model gpt41mini --result_dir budget_evaluation_results
+python run_experiments.py     --module m11_heat_transfer --model_name gpt41mini --budget
+python analysis/scoreboard.py  --model gpt41mini --budget
+python analysis/diagnostics.py trace --model gpt41mini --budget
 ```
 
 ### 📈 Analyzing Results
@@ -296,6 +298,12 @@ python analysis/diagnostics.py all      --model gpt41mini --subset_file configs/
 check; it caches the per-trial table, and `mistakes` / `trace` / `all` reuse
 it. Each sympy call is bounded by `--sympy_timeout` (default 20s) so a
 pathological expression can't hang the run.
+
+Both scripts (and `rejudge.py`) accept **`--budget`**: it reads
+`budget_evaluation_results/` instead, writes to separate CSVs
+(`results_by_trial_budget.csv`, `verdicts_<model>_budget.csv`), and adds
+grant-economics output — spend / funds-remaining / % overspent per cell, and
+SA% vs. spend quartile.
 
 Pass `--subset_file` whenever a model's results directory mixes cell coverage
 from more than one run config. After `diagnostics.py verdicts` has run,

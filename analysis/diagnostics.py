@@ -43,7 +43,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from newton_common import (  # noqa: E402
     load_trials, filter_to_subset, clean_rmsle_outliers, compute_verdicts, time_limit,
-    verdicts_csv_path, load_verified_labels, analysis_path,
+    verdicts_csv_path, load_verified_labels, analysis_path, resolve_result_dir,
     DEFAULT_RMSLE_THRESHOLD, DEFAULT_SYMPY_TIMEOUT, MAX_TURNS,
     MODULE_SHORT, SYS_SHORT, AGENT_SHORT, MODULE_ORDER, DIFFICULTIES, SYSTEMS,
 )
@@ -57,7 +57,14 @@ VERDICT_COLS = ["path", "module", "equation_difficulty", "model_system", "law_ve
                 "agent_backend", "trial_id", "is_fail", "status", "rounds", "num_experiments",
                 "total_tokens", "rmsle", "exact_accuracy", "judge_verdict", "rmsle_verdict",
                 "structural_verdict", "agreement_bucket", "raw_success", "verified_success",
-                "symbolic_msg", "submitted_law", "ground_truth_law"]
+                "symbolic_msg", "submitted_law", "ground_truth_law",
+                "budget_spent", "funds_remaining", "budget_overdraft", "budget_overspent",
+                "num_billed_requests", "starting_funds"]
+
+
+def _tag(args) -> str:
+    """Filename suffix so budgeted analysis outputs don't overwrite standard ones."""
+    return "_budget" if getattr(args, "budget", False) else ""
 
 
 def _load_filtered(args, include_fails: bool) -> pd.DataFrame:
@@ -77,7 +84,7 @@ def compute_and_write_verdicts(args) -> pd.DataFrame:
     and `trace` go through verdict_frame() which reuses the written CSV."""
     df = compute_verdicts(_load_filtered(args, include_fails=True),
                           args.rmsle_threshold, getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT))
-    out = verdicts_csv_path(args.model)
+    out = verdicts_csv_path(args.model, args.budget)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df[[c for c in VERDICT_COLS if c in df.columns]].to_csv(out, index=False)
     return df
@@ -87,15 +94,15 @@ def verdict_frame(args) -> pd.DataFrame:
     """Per-trial verdict table for `mistakes` / `trace`: reuse verdicts_<model>.csv
     if it exists and still covers every filtered trial, else run (and cache) the
     sympy pass. Avoids paying for structural checks 3x in `all`."""
-    cached = load_verified_labels(args.model)
+    cached = load_verified_labels(args.model, args.budget)
     if cached is not None:
         want = _load_filtered(args, include_fails=True)
         merged = want.drop(columns=[c for c in cached.columns if c != "path" and c in want.columns]) \
                      .merge(cached, on="path", how="left")
         if merged["agreement_bucket"].notna().all():
-            print(f"(reusing {verdicts_csv_path(args.model)} -- run `diagnostics.py verdicts` to refresh)")
+            print(f"(reusing {verdicts_csv_path(args.model, args.budget)} -- run `diagnostics.py verdicts` to refresh)")
             return merged
-        print("(verdicts_<model>.csv is stale / missing rows -- recomputing)")
+        print("(verdicts CSV is stale / missing rows -- recomputing)")
     return compute_and_write_verdicts(args)
 
 
@@ -151,7 +158,7 @@ def cmd_verdicts(args):
         print(f"\n=== Top {min(args.top, len(strict))} judge_strict (lowest RMSLE = likely false negative) ===")
         print(strict.sort_values("rmsle")[show + ["structural_verdict"]].head(args.top).to_string(index=False))
 
-    print(f"\nPer-trial verified_success labels written to {verdicts_csv_path(args.model)} "
+    print(f"\nPer-trial verified_success labels written to {verdicts_csv_path(args.model, args.budget)} "
           f"(scoreboard.py --verified and the other subcommands read this).")
 
 
@@ -230,7 +237,7 @@ def cmd_mistakes(args):
             print(f"    Submitted: {' '.join(str(row['submitted_law']).split())}")
             print(f"    Path:      {row['path']}")
 
-    out = analysis_path(f"mistake_taxonomy_{args.model}.csv")
+    out = analysis_path(f"mistake_taxonomy_{args.model}{_tag(args)}.csv")
     fails[["path", "module", "equation_difficulty", "model_system", "law_version", "agent_backend",
            "trial_id", "rmsle", "mistake_type", "mistake_detail", "submitted_law",
            "ground_truth_law"]].to_csv(out, index=False)
@@ -329,6 +336,38 @@ def _bin(df, col, bins, labels, tgt="verified_success"):
     return g
 
 
+def _budget_trace(df):
+    """Grant economics vs. outcome -- only when the run was budgeted."""
+    if "budget_spent" not in df.columns:
+        return
+    d = df.dropna(subset=["budget_spent"])
+    if d.empty:
+        return
+    print("\n--- budget vs. outcome ---")
+    g = d.groupby("verified_success")[["budget_spent", "funds_remaining", "num_billed_requests"]].mean()
+    if list(g.index) == [False, True]:
+        g.index = [f"fail(n={int((~d['verified_success']).sum())})",
+                   f"success(n={int(d['verified_success'].sum())})"]
+    print(g.round(1).to_string())
+    sub = d[["budget_spent", "verified_success"]].dropna()
+    if len(sub) >= 3 and sub["budget_spent"].std() > 0:
+        print(f"  corr(budget_spent, verified_success) = "
+              f"{sub['budget_spent'].corr(sub['verified_success'].astype(float)):+.3f}")
+    ov = d[d["budget_overspent"].fillna(False)]
+    if len(ov):
+        rest = d[~d["budget_overspent"].fillna(False)]
+        print(f"  overspent the grant: {len(ov)}/{len(d)} ({100*len(ov)/len(d):.1f}%), "
+              f"verified_success {100*ov['verified_success'].mean():.1f}% "
+              f"(others {100*rest['verified_success'].mean():.1f}%)")
+    try:
+        q = d["budget_spent"].quantile([0, .25, .5, .75, 1.0]).tolist()
+        if len(set(q)) == 5:
+            print("budget_spent quartiles:")
+            print(_bin(d, "budget_spent", q, ["Q1(cheap)", "Q2", "Q3", "Q4(spendy)"]).to_string())
+    except (ValueError, IndexError):
+        pass
+
+
 def _trace_report(df, label, example_sink):
     n = len(df)
     print(f"\n{'='*78}\n{label}   (n={n}, verified_success={100*df['verified_success'].mean():.1f}%)\n{'='*78}")
@@ -379,6 +418,8 @@ def _trace_report(df, label, example_sink):
             print(_bin(df, "total_tokens", q, ["Q1(few)", "Q2", "Q3", "Q4(most)"]).to_string())
     except (ValueError, IndexError):
         pass
+
+    _budget_trace(df)
 
     zero = df[df["num_experiments"] == 0]
     if len(zero):
@@ -444,7 +485,7 @@ def cmd_trace(args):
         for sig, loc in examples.items():
             print(f"  {sig}:\n    {loc}")
 
-    out = analysis_path(f"trajectory_trace_{args.model}.csv")
+    out = analysis_path(f"trajectory_trace_{args.model}{_tag(args)}.csv")
     keep = (["path", "module", "equation_difficulty", "model_system", "law_version", "agent_backend",
              "trial_id", "verified_success", "structural_verdict", "status"] + TRACE_NUMERIC + TRACE_BOOL)
     merged[[c for c in keep if c in merged.columns]].to_csv(out, index=False)
@@ -542,7 +583,7 @@ def cmd_agents(args):
               f"{100*d['w_sa']:>5.1f}  {AGENT_SHORT.get(d['loser'], d['loser']):>8} {100*d['l_sa']:>5.1f} "
               f"| {100*(d['w_sa']-d['l_sa']):>+5.1f}")
 
-    outdir = Path(analysis_path(f"divergent_cases/{args.model}"))
+    outdir = Path(analysis_path(f"divergent_cases/{args.model}{_tag(args)}"))
     outdir.mkdir(parents=True, exist_ok=True)
     manifest = []
     for idx, d in enumerate(divs[:args.max_examples]):
@@ -578,7 +619,11 @@ def main():
     for name in ("verdicts", "mistakes", "trace", "agents", "all"):
         p = sub.add_parser(name)
         p.add_argument("--model", required=True)
-        p.add_argument("--result_dir", default="evaluation_results")
+        p.add_argument("--result_dir", default=None,
+                       help="default: evaluation_results, or the budgeted tree when --budget is set")
+        p.add_argument("--budget", action="store_true",
+                       help="analyse a budgeted run: read the budget results tree, use a separate "
+                            "verdicts_<model>_budget.csv, and add a budget-vs-outcome block to `trace`")
         p.add_argument("--subset_file", default=None,
                        help="representative_subset.json -- pin analysis to one cell set.")
         p.add_argument("--agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
@@ -598,6 +643,7 @@ def main():
         args.samples = 8
     if not hasattr(args, "max_examples"):
         args.max_examples = 15
+    args.result_dir = resolve_result_dir(args.result_dir, args.budget)
 
     steps = {"verdicts": cmd_verdicts, "mistakes": cmd_mistakes,
              "trace": cmd_trace, "agents": cmd_agents}

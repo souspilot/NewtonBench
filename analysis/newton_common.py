@@ -76,13 +76,58 @@ MODULE_SHORT = {
 }
 
 ANALYSIS_DIR = Path(__file__).resolve().parent  # so paths work regardless of cwd
+REPO_ROOT = ANALYSIS_DIR.parent
 RESULTS_BY_TRIAL_CSV = str(ANALYSIS_DIR / "results_by_trial.csv")
+RESULTS_BY_TRIAL_BUDGET_CSV = str(ANALYSIS_DIR / "results_by_trial_budget.csv")
 AGGREGATED_SUMMARY_CSV = str(ANALYSIS_DIR / "aggregated_trial_summary.csv")
+
+# Per-trial budget fields (present only in budgeted runs; see utils/budget.py).
+BUDGET_COLS = ["budget_spent", "funds_remaining", "budget_overdraft", "budget_overspent",
+               "num_billed_requests", "starting_funds"]
 
 
 def analysis_path(name: str) -> str:
     """A path inside analysis/ (verdicts_<model>.csv, trace CSVs, ...), cwd-independent."""
     return str(ANALYSIS_DIR / name)
+
+
+def budget_result_dir() -> str:
+    """Directory tree budgeted runs write to (configs/budget/budget.json -> results_dir);
+    falls back to the documented default if the config can't be read."""
+    try:
+        import sys as _sys
+        if str(REPO_ROOT) not in _sys.path:
+            _sys.path.insert(0, str(REPO_ROOT))
+        from utils.budget import load_budget_config
+        return load_budget_config().results_dir
+    except Exception:
+        return "budget_evaluation_results"
+
+
+def resolve_result_dir(result_dir: Optional[str], budget: bool) -> str:
+    """`--result_dir` wins if given; otherwise pick the tree for the mode."""
+    if result_dir:
+        return result_dir
+    return budget_result_dir() if budget else "evaluation_results"
+
+
+def results_by_trial_csv(budget: bool) -> str:
+    """Budgeted runs get their own CSV so their rows never collide with standard
+    runs on the (model, module, ..., trial_id) upsert key."""
+    return RESULTS_BY_TRIAL_BUDGET_CSV if budget else RESULTS_BY_TRIAL_CSV
+
+
+def _budget_from_trial(data: dict) -> dict:
+    """Pull the flat budget columns out of a trial JSON's `budget` block."""
+    b = data.get("budget") or {}
+    return dict(
+        budget_spent=b.get("total_spent"),
+        funds_remaining=b.get("funds_remaining"),
+        budget_overdraft=b.get("overdraft"),
+        budget_overspent=b.get("overspent"),
+        num_billed_requests=b.get("num_billed_requests"),
+        starting_funds=b.get("starting_funds"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +194,7 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
                 rounds=data.get("rounds"),
                 num_experiments=data.get("num_experiments"),
                 total_tokens=data.get("total_tokens"),
+                **_budget_from_trial(data),
             ))
     if not rows:
         raise SystemExit(f"No trial files found under {model_dir}")
@@ -313,14 +359,14 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
 # verified_success label passing: diagnostics writes it, scoreboard reads it
 # ---------------------------------------------------------------------------
 
-def verdicts_csv_path(model: str) -> str:
-    return analysis_path(f"verdicts_{model}.csv")
+def verdicts_csv_path(model: str, budget: bool = False) -> str:
+    return analysis_path(f"verdicts_{model}{'_budget' if budget else ''}.csv")
 
 
-def load_verified_labels(model: str) -> Optional[pd.DataFrame]:
+def load_verified_labels(model: str, budget: bool = False) -> Optional[pd.DataFrame]:
     """The per-trial verified_success table diagnostics.py's `verdicts`
     subcommand writes. None if it was never run for this model."""
-    p = verdicts_csv_path(model)
+    p = verdicts_csv_path(model, budget)
     if not os.path.exists(p):
         return None
     return pd.read_csv(p)
@@ -350,14 +396,18 @@ def read_models_from_file(models_file: Path) -> List[str]:
 def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_TRIAL_CSV):
     """Compile every non-fail trial JSON for one model into results_by_trial.csv,
     upserting on the logical-config key (so re-running is idempotent)."""
+    base_cols = [
+        "trial_id", "module", "model_name", "noise_level", "equation_difficulty", "model_system",
+        "law_version", "agent_backend", "rmsle", "exact_accuracy", "rounds",
+        "experiments", "total_tokens", "file_version",
+    ] + BUDGET_COLS
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
+        for c in base_cols:  # keep older CSVs forward-compatible
+            if c not in df.columns:
+                df[c] = np.nan
     else:
-        df = pd.DataFrame(columns=[
-            "trial_id", "module", "model_name", "noise_level", "equation_difficulty", "model_system",
-            "law_version", "agent_backend", "rmsle", "exact_accuracy", "rounds",
-            "experiments", "total_tokens", "file_version",
-        ])
+        df = pd.DataFrame(columns=base_cols)
 
     model_dir = os.path.join(result_dir, model_name)
     if not os.path.isdir(model_dir):
@@ -395,6 +445,7 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
                     "experiments": data.get("num_experiments"),
                     "total_tokens": data.get("total_tokens"),
                     "file_version": extract_version_from_path(root),
+                    **_budget_from_trial(data),
                 }
                 mask = (
                     (df["trial_id"] == new_row["trial_id"])

@@ -21,8 +21,18 @@ behaves exactly as before.
 
 Budgeted results are written to a **separate** directory tree (default
 `budget_evaluation_results/`, set by `results_dir` below) so they never mix with
-the standard `evaluation_results/`. The analysis scripts take `--result_dir
-budget_evaluation_results` to score them.
+the standard `evaluation_results/`. The analysis scripts take a matching
+`--budget` flag:
+
+```bash
+python analysis/scoreboard.py  --model qwen38-27b --budget          # + a grant-economics section
+python analysis/diagnostics.py trace --model qwen38-27b --budget    # + budget-vs-outcome block
+python analysis/rejudge.py     --model qwen38-27b --budget --judge gpt41
+```
+
+`--budget` points each script at the budget tree, keeps its bookkeeping in
+separate files (`results_by_trial_budget.csv`, `verdicts_<model>_budget.csv`), and
+surfaces the per-trial spend / funds-remaining / overspent numbers.
 
 ## Editing costs — `budget.json`
 
