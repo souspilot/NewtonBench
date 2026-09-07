@@ -124,21 +124,28 @@ def check_experiment_completion(experiment_path: str, expected_trials: int = 4, 
     if not os.path.exists(experiment_path):
         return False, 0, expected_trials
 
-    # Check for aggregated results
     aggregated_path = os.path.join(experiment_path, "aggregated_results.json")
     trials_dir = os.path.join(experiment_path, "trials")
-    
-    if not os.path.exists(aggregated_path) or not os.path.exists(trials_dir):
+
+    # No trials directory at all -> nothing has been attempted.
+    if not os.path.exists(trials_dir):
         return False, 0, expected_trials
-    
-    # Read expected trials from aggregated results
-    try:
-        with open(aggregated_path, 'r') as f:
-            config = json.load(f)
-            expected_from_config = config.get('config', {}).get('trials', expected_trials)
-    except (json.JSONDecodeError, FileNotFoundError):
-        expected_from_config = expected_trials
-    
+
+    # aggregated_results.json is only written when run_experiment_for_version()
+    # finishes cleanly. If a run was interrupted (Ctrl-C, timeout, node
+    # preemption), the completed trial JSONs are on disk but the aggregate is
+    # missing -- so DON'T treat the config as 0% done here, or the resume pass
+    # re-runs the full trials_per_law instead of just the shortfall. Fall through
+    # to counting the trial files, using the caller's expected_trials as the target.
+    expected_from_config = expected_trials
+    if os.path.exists(aggregated_path):
+        try:
+            with open(aggregated_path, 'r') as f:
+                config = json.load(f)
+                expected_from_config = config.get('config', {}).get('trials', expected_trials)
+        except (json.JSONDecodeError, FileNotFoundError):
+            expected_from_config = expected_trials
+
     # Count actual trial files
     trial_json_files = glob.glob(os.path.join(trials_dir, "trial*.json"))
     # Filter out fail files
