@@ -5,6 +5,7 @@ import time
 import sys
 import importlib
 import re
+import glob
 from datetime import datetime
 from multiprocessing import Pool, cpu_count
 import numpy as np
@@ -14,6 +15,15 @@ import pandas as pd
 from utils.vanilla_agent import conduct_exploration
 import warnings
 warnings.filterwarnings("ignore")
+
+# When a configuration is run more than once (e.g. run_all_evaluations.py topping
+# up a partially-completed cell), successful trials accumulate in the same results
+# directory instead of scattering across fresh _vN directories. Only the most
+# recent TARGET_SUCCESSFUL_TRIALS successful trials are aggregated and left in the
+# top-level trials/ directory; older successes are moved to trials/superseded/ so
+# the analysis scripts (which glob trials/trial*.json non-recursively) see exactly
+# this many. Failed trials are always kept as trial*_fail.json.
+TARGET_SUCCESSFUL_TRIALS = 4
 
 try:
 	from utils.code_assisted_agent import conduct_code_assisted_exploration
@@ -225,17 +235,35 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     law_version_str = law_version if law_version is not None else "random"
        
     base_dir = os.path.join("evaluation_results", cli_args.model_name, cli_args.module, cli_args.agent_backend, cli_args.equation_difficulty, law_version_str)
-    
-    version_num = 1
-    while True:
-        experiment_name = f"{cli_args.model_system}_noise{noise_str}_v{version_num}"
-        full_path = os.path.join(base_dir, experiment_name)
-        if not os.path.exists(full_path):
-            break
-        version_num += 1
-    results_dir = os.path.join(base_dir, experiment_name)
+
+    # Reuse the latest existing results directory for this configuration so that
+    # re-runs accumulate successful trials rather than starting a fresh _vN dir.
+    def _dir_version(path):
+        m = re.search(r'_v(\d+)$', path)
+        return int(m.group(1)) if m else -1
+
+    existing_dirs = sorted(
+        glob.glob(os.path.join(base_dir, f"{cli_args.model_system}_noise{noise_str}_v*")),
+        key=_dir_version,
+    )
+    if existing_dirs:
+        results_dir = existing_dirs[-1]
+        print(f"Accumulating trials into existing results directory: {results_dir}")
+    else:
+        results_dir = os.path.join(base_dir, f"{cli_args.model_system}_noise{noise_str}_v1")
     trials_dir = os.path.join(results_dir, "trials")
     os.makedirs(trials_dir, exist_ok=True)
+
+    # New trials get ids after any trial (successful or failed) already on disk so
+    # nothing is overwritten.
+    def _trial_index(path):
+        m = re.match(r'trial(\d+)', os.path.basename(path))
+        return int(m.group(1)) if m else -1
+
+    next_trial_id = max(
+        (_trial_index(p) for p in glob.glob(os.path.join(trials_dir, "trial*.json"))),
+        default=-1,
+    ) + 1
 
     start_time = time.time()
     
@@ -244,7 +272,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     
     pool_args = [
         (i, cli_args.noise, cli_args.model_name, cli_args.module, cli_args.equation_difficulty, cli_args.model_system, law_version, trials_dir, max_retries, judge_model_name, cli_args.agent_backend)
-        for i in range(num_trials)
+        for i in range(next_trial_id, next_trial_id + num_trials)
     ]
     
     # Run trials with dynamic batch processing based on CPU count
@@ -281,11 +309,33 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     end_time = time.time()
 
     # --- Aggregate and Print Final Results ---
-    # Filter out any trials that failed due to errors
-    valid_results = [r for r in results if "error" not in r]
-    failed_results = [r for r in results if "error" in r]
+    # Load every trial on disk for this configuration (this run plus any earlier
+    # runs), keep the most recent TARGET_SUCCESSFUL_TRIALS successful ones for
+    # analysis and move the rest into trials/superseded/. Failed trials are kept
+    # in place for failure-mode analysis but never counted as successes.
+    def _load_json(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    success_files = sorted(
+        (p for p in glob.glob(os.path.join(trials_dir, "trial*.json"))
+         if not p.endswith("_fail.json")),
+        key=os.path.getmtime,
+    )
+    if len(success_files) > TARGET_SUCCESSFUL_TRIALS:
+        superseded_dir = os.path.join(trials_dir, "superseded")
+        os.makedirs(superseded_dir, exist_ok=True)
+        for p in success_files[:-TARGET_SUCCESSFUL_TRIALS]:
+            chat_log = re.sub(r'\.json$', '_chat_history.log', p)
+            for src in (p, chat_log):
+                if os.path.exists(src):
+                    os.replace(src, os.path.join(superseded_dir, os.path.basename(src)))
+        success_files = success_files[-TARGET_SUCCESSFUL_TRIALS:]
+
+    valid_results = [_load_json(p) for p in success_files]
+    failed_results = [_load_json(p) for p in glob.glob(os.path.join(trials_dir, "trial*_fail.json"))]
     all_results = valid_results + failed_results
-    
+
     if not valid_results:
         print(f"\nAll trials for law_version '{law_version}' failed. Please check the logs in '{results_dir}'.")
         return
@@ -317,7 +367,8 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     print(f"  - Model System: {cli_args.model_system}")
     print(f"  - Max Retries per Trial: {max_retries}")
     print(f"  - LLM Judge: {judge_model_name}")
-    print(f"  - Total Trials: {num_trials} ({len(valid_results)} successful)")
+    print(f"  - Trials Run This Invocation: {num_trials}")
+    print(f"  - Successful Trials Analyzed: {len(valid_results)} (most recent, cap {TARGET_SUCCESSFUL_TRIALS})")
     print(f"  - Total Runtime: {end_time - start_time:.2f} seconds")
     print(f"  - Backend: {cli_args.agent_backend}")
     print("-"*50)
@@ -344,7 +395,9 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
             "equation_difficulty": cli_args.equation_difficulty,
             "law_version": law_version,
             "model_system": cli_args.model_system,
-            "trials": num_trials,
+            "trials": TARGET_SUCCESSFUL_TRIALS,
+            "trials_run_this_invocation": num_trials,
+            "successful_trials_analyzed": len(valid_results),
             "max_retries": max_retries,
             "LLM judge": judge_model_name,
             "Agent backend": cli_args.agent_backend,
