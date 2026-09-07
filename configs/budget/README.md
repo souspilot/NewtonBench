@@ -44,12 +44,12 @@ agent-facing explanation is generated from these numbers by `utils/budget.py`.
 | `results_dir` | Directory tree for budgeted runs. |
 | `currency` | Symbol shown in prompts / logs. |
 | `defaults.starting_funds` | Grant size per trial. |
-| `defaults.min_spend_fraction` | Fraction of starting funds (0–1) the agent must spend before it can submit `<final_law>`. Submissions before this threshold are rejected with a message telling the agent to keep experimenting. |
-| `defaults.cost_model.request_fee` | Fixed charge per `<run_experiment>` call, any size. |
-| `defaults.cost_model.per_datapoint_cost` | Charge per parameter set in the JSON array. |
+| `defaults.cost_model.request_fee_per_param` | Setup fee charged **per varied input parameter** in a request. A controlled sweep that changes one variable pays 1×; a request where points differ on 3 inputs pays 3×. |
+| `defaults.cost_model.per_datapoint_cost` | Base charge per parameter set in the JSON array (before tier and precision multipliers). |
+| `defaults.cost_model.batch_tiers` | Step-wise convex pricing tiers as `[[threshold, multiplier], ...]`. Points are priced in marginal brackets: the first *threshold₁* points cost `per_datapoint_cost × multiplier₁` each, the next band costs `per_datapoint_cost × multiplier₂`, etc. Larger batches cost progressively more per point. |
 | `defaults.cost_model.default_precision` | Precision assumed when the agent omits the field. |
 | `defaults.cost_model.precision_multipliers` | `precision` value (1–5) → per-datapoint cost multiplier. |
-| `defaults.cost_model.precision_sig_figs` | `precision` value (1–5) → significant figures the reading is rounded to. This is what makes precision matter **even at zero noise**: a cheap sensor gives you a coarse (e.g. 3-sig-fig) number, an expensive one gives you more digits. With measurement noise, higher precision *additionally* averages that many replicate samples (error ~ 1/√k). |
+| `defaults.cost_model.precision_sig_figs` | `precision` value (1–5) → significant figures the reading is rounded to. This is what makes precision matter **even at zero noise**: a cheap sensor gives you a coarse (e.g. 1-sig-fig) number, an expensive one gives you more digits. With measurement noise, higher precision *additionally* averages that many replicate samples (error ~ 1/√k). |
 | `defaults.cost_model.magnitude_surcharge.reference_low` / `reference_high` | The "ordinary equipment" window for parameter values. |
 | `defaults.cost_model.magnitude_surcharge.fraction_per_decade_outside` | Extra fraction of a datapoint's cost per order of magnitude any parameter falls outside that window. |
 | `defaults.notes` | Optional extra sentence appended to every module's cost explanation. |
@@ -57,9 +57,8 @@ agent-facing explanation is generated from these numbers by `utils/budget.py`.
 ### Per-module overrides
 
 Anything under `modules.<module_name>` is deep-merged onto `defaults` for that
-module only. Example already in the file: `m11_heat_transfer` gets a larger grant,
-a higher per-datapoint cost, and a bespoke `notes` line. Add a block for any
-module that needs different economics; omit it and the module uses `defaults`.
+module only. Add a block for any module that needs different economics; omit it
+and the module uses `defaults`.
 
 ## Experiment volume caps
 
