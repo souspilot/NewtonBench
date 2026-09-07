@@ -462,6 +462,16 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
                 else:
                     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
 
+    config_cols = ["module", "model_name", "noise_level", "equation_difficulty",
+                   "model_system", "law_version", "agent_backend"]
+    present = [c for c in config_cols if c in df.columns]
+    if present:
+        max_trials = 4
+        df = (df.sort_values("trial_id", ascending=False)
+                .groupby(present, dropna=False)
+                .head(max_trials)
+                .sort_index())
+
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     df.to_csv(csv_path, index=False)
     print(f"Results updated in {csv_path}")
