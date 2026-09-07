@@ -5,11 +5,16 @@
   "currency": "$",
 
   "defaults": {
-    "starting_funds": 2000.0,
-    "min_spend_fraction": 0.5,
+    "starting_funds": 1000.0,
     "cost_model": {
-      "request_fee": 50.0,
-      "per_datapoint_cost": 10.0,
+      "request_fee_per_param": 30.0,
+      "per_datapoint_cost": 15.0,
+      "batch_tiers": [
+        [5,  1.0],
+        [10, 2.0],
+        [15, 3.5],
+        [20, 6.0]
+      ],
       "default_precision": 1,
       "precision_multipliers": {
         "1": 1.0,

@@ -27,22 +27,19 @@ import json
 import math
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _DEFAULT_CONFIG_PATH = os.path.join("configs", "budget", "budget.json")
 
-# Fallback used only if configs/budget/budget.json is missing or unreadable while
-# budget mode is requested. Keeps a --budget run working (with a warning) instead
-# of crashing.
 _BUILTIN_DEFAULTS: Dict[str, Any] = {
     "results_dir": "budget_evaluation_results",
     "currency": "$",
     "defaults": {
-        "starting_funds": 2000.0,
-        "min_spend_fraction": 0.5,
+        "starting_funds": 1000.0,
         "cost_model": {
-            "request_fee": 50.0,
-            "per_datapoint_cost": 10.0,
+            "request_fee_per_param": 30.0,
+            "per_datapoint_cost": 15.0,
+            "batch_tiers": [[5, 1.0], [10, 2.0], [15, 3.5], [20, 6.0]],
             "default_precision": 1,
             "precision_multipliers": {"1": 1.0, "2": 1.6, "3": 2.5, "4": 4.0, "5": 6.5},
             "precision_sig_figs": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 6},
@@ -97,7 +94,6 @@ class BudgetConfig:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            # Fill any missing top-level pieces from the builtin defaults.
             raw = _deep_merge(_BUILTIN_DEFAULTS, raw)
             return cls(raw, source=path)
         except (FileNotFoundError, json.JSONDecodeError) as e:
@@ -108,13 +104,16 @@ class BudgetConfig:
         merged = _deep_merge(self._defaults, self._modules.get(module_name, {}))
         cm = merged.get("cost_model", {})
         ms = cm.get("magnitude_surcharge", {})
+        batch_tiers_raw = cm.get("batch_tiers", [[20, 1.0]])
+        batch_tiers = [(int(t[0]), float(t[1])) for t in batch_tiers_raw]
+        batch_tiers.sort(key=lambda t: t[0])
         return ModuleBudget(
             module_name=module_name,
             currency=self.currency,
-            starting_funds=float(merged.get("starting_funds", 2000.0)),
-            min_spend_fraction=float(merged.get("min_spend_fraction", 0.5)),
-            request_fee=float(cm.get("request_fee", 50.0)),
-            per_datapoint_cost=float(cm.get("per_datapoint_cost", 10.0)),
+            starting_funds=float(merged.get("starting_funds", 1000.0)),
+            request_fee_per_param=float(cm.get("request_fee_per_param", 30.0)),
+            per_datapoint_cost=float(cm.get("per_datapoint_cost", 15.0)),
+            batch_tiers=batch_tiers,
             default_precision=int(cm.get("default_precision", 1)),
             precision_multipliers={int(k): float(v) for k, v in cm.get("precision_multipliers", {}).items()},
             precision_sig_figs={int(k): int(v) for k, v in cm.get("precision_sig_figs", {}).items()},
@@ -131,6 +130,8 @@ class BatchPricing:
     cleaned_experiments: List[Dict[str, Any]]   # 'precision' removed, ready for the physics call
     precisions: List[int]                       # per-experiment precision actually used
     per_experiment_cost: List[float]
+    request_fee: float = 0.0
+    num_varied_params: int = 0
 
 
 @dataclass
@@ -138,9 +139,9 @@ class ModuleBudget:
     module_name: str
     currency: str
     starting_funds: float
-    min_spend_fraction: float
-    request_fee: float
+    request_fee_per_param: float
     per_datapoint_cost: float
+    batch_tiers: List[Tuple[int, float]]
     default_precision: int
     precision_multipliers: Dict[int, float]
     precision_sig_figs: Dict[int, int]
@@ -184,11 +185,6 @@ class ModuleBudget:
         return max(p, 1)
 
     def sig_figs(self, precision: int) -> int:
-        """Significant figures the sensor reports at this precision level.
-
-        This is what makes precision matter even with zero measurement noise:
-        a cheap (low-precision) reading is rounded hard, an expensive one is not.
-        """
         if precision in self.precision_sig_figs:
             return self.precision_sig_figs[precision]
         if not self.precision_sig_figs:
@@ -196,33 +192,76 @@ class ModuleBudget:
         nearest = min(self.precision_sig_figs, key=lambda k: abs(k - precision))
         return self.precision_sig_figs[nearest]
 
+    def _tiered_datapoint_cost(self, batch_index: int) -> float:
+        """Per-datapoint base cost for the (batch_index+1)-th point in a batch.
+
+        Uses marginal-bracket pricing: the first few points are cheap, later
+        points in the same request cost more (step-wise convex).
+        """
+        position = batch_index + 1  # 1-based
+        for threshold, multiplier in self.batch_tiers:
+            if position <= threshold:
+                return self.per_datapoint_cost * multiplier
+        # Beyond all tiers: use the last tier's multiplier
+        return self.per_datapoint_cost * self.batch_tiers[-1][1]
+
+    def _count_varied_params(self, experiments: List[Dict[str, Any]]) -> int:
+        """Count parameters that take more than one distinct value across the batch."""
+        if len(experiments) <= 1:
+            return max(1, len(experiments[0]) if experiments else 0)
+        all_keys: set = set()
+        for exp in experiments:
+            all_keys.update(exp.keys())
+        varied = 0
+        for key in all_keys:
+            vals = set()
+            for exp in experiments:
+                if key in exp:
+                    v = exp[key]
+                    vals.add(v if not isinstance(v, float) or v == v else "__nan__")
+            if len(vals) > 1:
+                varied += 1
+        return max(varied, 1)
+
     def price_batch(self, experiments: List[Dict[str, Any]]) -> BatchPricing:
         cleaned: List[Dict[str, Any]] = []
         precisions: List[int] = []
         per_exp_cost: List[float] = []
-        total = self.request_fee if experiments else 0.0
+
+        # Strip precision from experiments before counting varied params
+        stripped_exps: List[Dict[str, Any]] = []
+        raw_precisions: List[int] = []
         for exp in experiments:
             exp = dict(exp) if isinstance(exp, dict) else {}
             precision = self._coerce_precision(exp.pop("precision", self.default_precision))
+            stripped_exps.append(exp)
+            raw_precisions.append(precision)
+
+        num_varied = self._count_varied_params(stripped_exps) if stripped_exps else 0
+        request_fee = self.request_fee_per_param * num_varied if stripped_exps else 0.0
+        total = request_fee
+
+        for i, (exp, precision) in enumerate(zip(stripped_exps, raw_precisions)):
             surcharge = self._magnitude_surcharge_fraction(exp)
-            cost = self.per_datapoint_cost * self._precision_multiplier(precision) * (1.0 + surcharge)
+            base_cost = self._tiered_datapoint_cost(i)
+            cost = base_cost * self._precision_multiplier(precision) * (1.0 + surcharge)
             cleaned.append(exp)
             precisions.append(precision)
             per_exp_cost.append(cost)
             total += cost
-        return BatchPricing(round(total, 4), cleaned, precisions, [round(c, 4) for c in per_exp_cost])
+
+        return BatchPricing(
+            total_cost=round(total, 4),
+            cleaned_experiments=cleaned,
+            precisions=precisions,
+            per_experiment_cost=[round(c, 4) for c in per_exp_cost],
+            request_fee=round(request_fee, 4),
+            num_varied_params=num_varied,
+        )
 
     # ---- measurement -----------------------------------------------------
     def measure(self, module, exp: Dict[str, Any], precision: int, *,
                 noise_level: float, difficulty: str, system: str, law_version: Optional[str]) -> Any:
-        """One paid measurement.
-
-        - Under measurement noise, precision k averages k replicate samples
-          (error shrinks ~1/sqrt(k)).
-        - Regardless of noise, the reading is then quantised to the number of
-          significant figures the paid-for sensor resolves (sig_figs(precision)).
-          This is why buying precision is worth something even at zero noise.
-        """
         replicates = precision if noise_level and noise_level > 0.0 else 1
         replicates = max(1, int(replicates))
         results = [
@@ -236,26 +275,17 @@ class ModuleBudget:
         return _round_to_sig_figs(value, self.sig_figs(precision))
 
     # ---- prompt text (generated from the numbers above) ------------------
-    def min_spend_amount(self) -> float:
-        return self.starting_funds * self.min_spend_fraction
-
     def system_note(self) -> str:
         c = self.currency
-        pct = int(self.min_spend_fraction * 100)
         return (
             "**Research budget:** This mission is *budgeted*. You are the principal "
             "investigator on a grant with finite funds. Every `<run_experiment>` call "
             "is billed against the grant, and every `<experiment_output>` tells you the "
             f"funds remaining (in {c}). Running out of money does not end the mission, "
             f"but every {c} spent past zero is recorded and counts against you. Plan "
-            "your experimental campaign the way a real lab lead must: batch measurements, "
-            "buy precision only where it changes your conclusion, and keep enough in "
-            "reserve to finish.\n\n"
-            f"**Minimum spend rule:** You must spend at least {pct}% of your starting "
-            f"funds ({c}{self.min_spend_amount():,.0f}) before submitting your "
-            "`<final_law>`. Early submissions will be rejected. Use the budget to "
-            "thoroughly explore the parameter space, verify your hypotheses with "
-            "higher-precision measurements, and test edge cases."
+            "your experimental campaign the way a real lab lead must: choose batch sizes "
+            "carefully, buy precision only where it changes your conclusion, and keep "
+            "enough in reserve to verify before you submit."
         )
 
     def cost_explanation(self) -> str:
@@ -266,29 +296,38 @@ class ModuleBudget:
             + ("   (default)" if k == self.default_precision else "")
             for k in sorted(pm)
         )
-        pct = int(self.min_spend_fraction * 100)
+        tier_lines = []
+        prev = 0
+        for threshold, mult in self.batch_tiers:
+            tier_lines.append(
+                f"      points {prev + 1}-{threshold}: {c}{self.per_datapoint_cost * mult:g} each (x{mult:g})"
+            )
+            prev = threshold
+        tier_text = "\n".join(tier_lines)
         lines = [
             "**How experiments are billed (this run only):**",
-            f"- Fixed setup fee: {c}{self.request_fee:g} per `<run_experiment>` call, whatever its size.",
-            f"- Per data point: {c}{self.per_datapoint_cost:g} for each parameter set in your JSON array "
-            "(a 10-row array is 10 data points).",
+            f"- Setup fee: {c}{self.request_fee_per_param:g} for each input parameter "
+            "you vary in the request. A controlled sweep that changes only one variable "
+            f"pays {c}{self.request_fee_per_param:g}; a request where every point differs "
+            f"on 3 inputs pays {c}{self.request_fee_per_param * 3:g}.",
+            "- Per data point (step-wise pricing — larger batches cost progressively more "
+            "per point):",
+            tier_text,
             "- Precision / sensor grade: add an optional integer `\"precision\"` field to any parameter set. "
             "A better sensor costs more but reports the reading to more significant figures:",
             prec_lines,
-            f"    The reading is rounded to that many significant figures even when measurements are "
-            f"noise-free, so buying precision always buys real information. When measurements are noisy, "
-            f"precision k additionally averages k repeated samples of that point (error ~ 1/sqrt(k)).",
+            "    The reading is rounded to that many significant figures even when measurements are "
+            "noise-free, so buying precision always buys real information. When measurements are noisy, "
+            "precision k additionally averages k repeated samples of that point (error ~ 1/sqrt(k)).",
             f"- Exotic-range surcharge: any parameter whose magnitude falls outside "
             f"[{self.ref_low:g}, {self.ref_high:g}] adds {self.frac_per_decade * 100:g}% to that data point's "
             f"cost per order of magnitude beyond the window (specialised apparatus).",
             f"- Starting funds for this mission: {c}{self.starting_funds:g}.",
-            f"- **Minimum spend:** You must use at least {pct}% of your budget "
-            f"({c}{self.min_spend_amount():,.0f}) before you can submit `<final_law>`.",
         ]
         if self.notes:
             lines.append(f"- Note: {self.notes}")
         lines.append(
-            "Example billed request (setup fee + 2 points, the second one high-precision):\n"
+            "Example billed request (setup fee for 1 varied param + 2 points, the second one high-precision):\n"
             "<run_experiment>\n"
             "[\n"
             "  {\"...\": 1.0},\n"
@@ -359,25 +398,6 @@ class BudgetTracker:
         self.overdraft = 0.0          # max amount the balance has ever been below zero
         self.num_charges = 0
         self.history: List[Dict[str, Any]] = []
-
-    def meets_min_spend(self) -> bool:
-        """True if the agent has spent at least the required fraction of the budget."""
-        return self.spent >= self.mb.min_spend_amount()
-
-    def min_spend_rejection(self) -> str:
-        """Message returned when the agent tries to submit before meeting the minimum spend."""
-        c = self.currency
-        pct = int(self.mb.min_spend_fraction * 100)
-        needed = self.mb.min_spend_amount()
-        shortfall = needed - self.spent
-        return (
-            f"**Submission rejected:** You have only spent {c}{self.spent:,.0f} of your "
-            f"{c}{self.mb.starting_funds:,.0f} budget. You must spend at least {pct}% "
-            f"({c}{needed:,.0f}) before submitting your final law. You still need to "
-            f"spend {c}{shortfall:,.0f} more. Continue experimenting — explore additional "
-            "parameter ranges, buy higher-precision measurements to refine your constants, "
-            "or test edge cases to verify your hypothesis."
-        )
 
     def charge(self, amount: float, meta: Optional[Dict[str, Any]] = None) -> None:
         amount = round(float(amount), 4)
