@@ -13,6 +13,7 @@ import traceback
 import pandas as pd
 
 from utils.vanilla_agent import conduct_exploration
+from utils.budget import is_budget_enabled, load_budget_config
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -47,7 +48,7 @@ def format_chat_history(chat_history):
     return '\n'.join(lines)
 
 def write_fail_result_with_retries(args, final_error, retry_history, func_sig):
-    trial_id, noise_level, model_name, module_name, difficulty, system, law_version, trial_dir, max_retries, judge_model_name, agent_backend = args
+    trial_id, noise_level, model_name, module_name, difficulty, system, law_version, trial_dir, max_retries, judge_model_name, agent_backend, budget_mode = args
     fail_result = {
         "trial_id": trial_id,
         "module_name": module_name,
@@ -67,6 +68,7 @@ def write_fail_result_with_retries(args, final_error, retry_history, func_sig):
         "total_tokens": 0,
         "num_experiments": 0,
         "chat_history": [],
+        "budget": None,
         "evaluation": {
             "rmsle": float("nan"),
             "exact_accuracy": 0.0,
@@ -100,8 +102,8 @@ def run_trial(args):
     - A `run_experiment_for_module(...)` function.
     - An `evaluate_law(str)` function.
     """
-    trial_id, noise_level, model_name, module_name, difficulty, system, law_version, trial_dir, max_retries, judge_model_name, agent_backend = args
-    print(f"Starting trial {trial_id} for module '{module_name}' with {model_name}, noise {noise_level} (equation difficulty: {difficulty}, model system: {system}, law version: {law_version}, backend: {agent_backend}")
+    trial_id, noise_level, model_name, module_name, difficulty, system, law_version, trial_dir, max_retries, judge_model_name, agent_backend, budget_mode = args
+    print(f"Starting trial {trial_id} for module '{module_name}' with {model_name}, noise {noise_level} (equation difficulty: {difficulty}, model system: {system}, law version: {law_version}, backend: {agent_backend}, budget: {budget_mode})")
     
     retry_history = []
     final_error = None
@@ -115,7 +117,12 @@ def run_trial(args):
             
             # Dynamically import the specified module for this process
             module = importlib.import_module(f"modules.{module_name}")
-            
+
+            # Resolve the per-module budget (None unless budget mode is on)
+            module_budget = None
+            if budget_mode:
+                module_budget = load_budget_config().module_budget(module_name)
+
             # 1. Let the LLM explore and discover the law for the given module
             trial_info = {
                 'trial_id': trial_id,
@@ -139,7 +146,8 @@ def run_trial(args):
                     difficulty=difficulty,
                     system=system,
                     law_version=law_version,
-                    trial_info=trial_info
+                    trial_info=trial_info,
+                    budget=module_budget
                 )
             else:
                 exploration_result = conduct_exploration(
@@ -149,7 +157,8 @@ def run_trial(args):
                     difficulty=difficulty,
                     system=system,
                     law_version=law_version,
-                    trial_info=trial_info
+                    trial_info=trial_info,
+                    budget=module_budget
                 )
 
             # 2. Evaluate the submitted law using the module's specific evaluator
@@ -233,8 +242,13 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     # Create unique results directory with hierarchical structure
     noise_str = str(cli_args.noise).replace('.', '_')
     law_version_str = law_version if law_version is not None else "random"
-       
-    base_dir = os.path.join("evaluation_results", cli_args.model_name, cli_args.module, cli_args.agent_backend, cli_args.equation_difficulty, law_version_str)
+
+    # Budgeted runs are written to a separate tree (configs/budget/budget.json ->
+    # results_dir) so they never mix with the standard evaluation_results/.
+    budget_mode = is_budget_enabled(getattr(cli_args, "budget", False))
+    results_root = load_budget_config().results_dir if budget_mode else "evaluation_results"
+
+    base_dir = os.path.join(results_root, cli_args.model_name, cli_args.module, cli_args.agent_backend, cli_args.equation_difficulty, law_version_str)
 
     # Reuse the latest existing results directory for this configuration so that
     # re-runs accumulate successful trials rather than starting a fresh _vN dir.
@@ -271,7 +285,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     judge_model_name = cli_args.model_name # HACK for API poor researchers :-(
     
     pool_args = [
-        (i, cli_args.noise, cli_args.model_name, cli_args.module, cli_args.equation_difficulty, cli_args.model_system, law_version, trials_dir, max_retries, judge_model_name, cli_args.agent_backend)
+        (i, cli_args.noise, cli_args.model_name, cli_args.module, cli_args.equation_difficulty, cli_args.model_system, law_version, trials_dir, max_retries, judge_model_name, cli_args.agent_backend, budget_mode)
         for i in range(next_trial_id, next_trial_id + num_trials)
     ]
     
@@ -355,6 +369,23 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     total_retries = sum(all_retry_attempts)
     trials_with_retries = sum(1 for attempts in all_retry_attempts if attempts > 0)
 
+    # Budget statistics (only present when the run was budgeted)
+    budget_summaries = [r.get('budget') for r in valid_results if r.get('budget')]
+    budget_stats = None
+    if budget_summaries:
+        spent = [b['total_spent'] for b in budget_summaries]
+        remaining = [b['funds_remaining'] for b in budget_summaries]
+        overdraft = [b['overdraft'] for b in budget_summaries]
+        budget_stats = {
+            "currency": budget_summaries[0].get('currency', '$'),
+            "starting_funds": budget_summaries[0].get('starting_funds'),
+            "average_spent": float(np.mean(spent)),
+            "average_funds_remaining": float(np.mean(remaining)),
+            "average_overdraft": float(np.mean(overdraft)),
+            "trials_overspent": int(sum(1 for b in budget_summaries if b.get('overspent'))),
+            "num_budgeted_trials": len(budget_summaries),
+        }
+
     print("\n" + "="*50)
     print("BENCHMARK COMPLETED")
     print("="*50)
@@ -384,6 +415,15 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     print(f"    * Trials with Retries: {trials_with_retries}/{len(all_results)} ({trials_with_retries/len(all_results)*100:.1f}%)")
     print(f"    * Average Retries per Trial: {np.mean(all_retry_attempts):.2f}")
     print(f"    * Failed Trials (after all retries): {len(failed_results)}")
+    if budget_stats:
+        cur = budget_stats["currency"]
+        print("-"*50)
+        print(f"  - Budget Statistics (mode: ON):")
+        print(f"    * Starting Funds: {cur}{budget_stats['starting_funds']:,.2f}")
+        print(f"    * Average Spent: {cur}{budget_stats['average_spent']:,.2f}")
+        print(f"    * Average Funds Remaining: {cur}{budget_stats['average_funds_remaining']:,.2f}")
+        print(f"    * Average Overdraft: {cur}{budget_stats['average_overdraft']:,.2f}")
+        print(f"    * Trials That Overspent: {budget_stats['trials_overspent']}/{budget_stats['num_budgeted_trials']}")
     print("="*50)
 
     # Write aggregate results and config
@@ -401,6 +441,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
             "max_retries": max_retries,
             "LLM judge": judge_model_name,
             "Agent backend": cli_args.agent_backend,
+            "budget_mode": bool(budget_mode),
             "runtime_seconds": end_time - start_time
         },
         "aggregate": {
@@ -419,7 +460,8 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
                 "trials_with_retries_percentage": float(trials_with_retries/len(all_results)*100),
                 "average_retries_per_trial": float(np.mean(all_retry_attempts)),
                 "failed_trials_after_retries": len(failed_results)
-            }
+            },
+            "budget_statistics": budget_stats,
         },
     }
     agg_path = os.path.join(results_dir, "aggregated_results.json")
@@ -444,6 +486,12 @@ if __name__ == "__main__":
                       help="Specific law version to use, 'all' for all versions, or None for random selection or a specific version (e.g. v0, v1, v2)")
     parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
                       help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
+    parser.add_argument("--budget", action="store_true",
+                      help="Enable budgeted 'principal investigator' mode: every <run_experiment> call is billed "
+                           "against a finite grant, the cost model is explained in the prompts, and each "
+                           "<experiment_output> reports funds remaining. Costs are set in configs/budget/budget.json. "
+                           "Results are written to a separate directory tree (default budget_evaluation_results/). "
+                           "Can also be enabled with NEWTONBENCH_BUDGET=1.")
     cli_args = parser.parse_args()
 
     # --- Pre-flight Check ---

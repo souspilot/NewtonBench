@@ -8,6 +8,8 @@ import time
 from typing import Tuple, List, Dict, Optional
 from collections import defaultdict
 
+from utils.budget import is_budget_enabled, load_budget_config
+
 def get_module_folders():
     """Scan the 'modules' directory for all module folders (e.g., m0_gravity)."""
     module_dir = 'modules'
@@ -72,18 +74,19 @@ def load_subset_cells(subset_file: str) -> SubsetCells:
         for module_name, cells in raw.items()
     }
 
-def get_experiment_path(model_name: str, module: str, agent_backend: str, difficulty: str, 
-                       law_version: str, system: str, noise_level: float) -> str:
+def get_experiment_path(model_name: str, module: str, agent_backend: str, difficulty: str,
+                       law_version: str, system: str, noise_level: float,
+                       results_root: str = "evaluation_results") -> str:
     """Generate standardized experiment directory path."""
     noise_str = str(noise_level).replace('.', '_')
     law_version_str = law_version if law_version is not None else "random"
-         
+
     # Standard behavior: Find the latest version number for this configuration
     base_pattern = os.path.join(
-        "evaluation_results", model_name, module, agent_backend, difficulty, law_version_str, 
+        results_root, model_name, module, agent_backend, difficulty, law_version_str,
         f"{system}_noise{noise_str}_v*"
     )
-    
+
     existing_dirs = glob.glob(base_pattern)
     if existing_dirs:
         # Find the highest version number
@@ -96,13 +99,13 @@ def get_experiment_path(model_name: str, module: str, agent_backend: str, diffic
                 continue
         latest_version = max(version_nums) if version_nums else 0
         return os.path.join(
-            "evaluation_results", model_name, module, agent_backend, difficulty, law_version_str,
+            results_root, model_name, module, agent_backend, difficulty, law_version_str,
             f"{system}_noise{noise_str}_v{latest_version}"
         )
     else:
         # No existing directory, will be created as v1
         return os.path.join(
-            "evaluation_results", model_name, module, agent_backend, difficulty, law_version_str,
+            results_root, model_name, module, agent_backend, difficulty, law_version_str,
             f"{system}_noise{noise_str}_v1"
         )
 
@@ -268,10 +271,18 @@ def main():
                       help="Only check completion status, don't run experiments")
     parser.add_argument("--dry_run", action="store_true", 
                       help="Show what would be executed without running anything")
-    parser.add_argument("--no_prompt", action="store_true", 
+    parser.add_argument("--no_prompt", action="store_true",
                       help="Don't prompt for confirmation before starting")
-    
+    parser.add_argument("--budget", action="store_true",
+                      help="Enable budgeted 'principal investigator' mode (see configs/budget/README.md). "
+                           "Costs come from configs/budget/budget.json; results go to a separate directory "
+                           "tree (default budget_evaluation_results/). Also settable via NEWTONBENCH_BUDGET=1.")
+
     args = parser.parse_args()
+    budget_mode = is_budget_enabled(args.budget)
+    results_root = load_budget_config().results_dir if budget_mode else "evaluation_results"
+    if budget_mode:
+        print(f"Budgeted mode ON -- reading/writing under '{results_root}/'.")
 
     modules = get_module_folders()
     if not modules:
@@ -399,8 +410,9 @@ def main():
                         continue
                     for law_version in law_versions:
                         config_name = get_configuration_name(module_name, difficulty, system, law_version, noise_level)
-                        experiment_path = get_experiment_path(args.model_name, module_name, args.agent_backend, 
-                                                           difficulty, law_version, system, noise_level)
+                        experiment_path = get_experiment_path(args.model_name, module_name, args.agent_backend,
+                                                           difficulty, law_version, system, noise_level,
+                                                           results_root=results_root)
                         
                         is_complete, completed_trials, expected_trials = check_experiment_completion(
                             experiment_path, args.trials_per_law, args.model_name, args.agent_backend)
@@ -495,6 +507,8 @@ def main():
             "--agent_backend", args.agent_backend,
             "--noise", str(config['noise_level'])
         ]
+        if budget_mode:
+            command.append("--budget")
 
         print(f"Command: {' '.join(command)}")
         

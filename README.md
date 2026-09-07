@@ -120,7 +120,10 @@ The `quick_start.py` script will run two simple experiments using the `gpt41mini
 NewtonBench/
 ├── .env                          # environment variables (API keys)
 ├── configs/                      # Configuration files
-│   └── models.txt                # List of LLM models to evaluate
+│   ├── models.txt                # List of LLM models to evaluate
+│   ├── experiment_limits.json    # Hard caps on data points per request / per trial (all runs)
+│   └── budget/                   # Budgeted-mode cost model (see budget/README.md)
+│       └── budget.json           # Editable cost values (global + per-module)
 │
 ├── modules/                      # Physics domain modules (12 domains)
 │   ├── common/                   # Shared utilities and base classes
@@ -155,6 +158,8 @@ NewtonBench/
 │   ├── code_assisted_agent.py    # Code-assisted agent
 │   ├── code_executor.py          # Code execution environment
 │   ├── code_executor_base.py     # Base code executor interface
+│   ├── budget.py                 # Budgeted-mode cost engine + prompt text
+│   ├── limits.py                 # Enforces configs/experiment_limits.json
 │   └── noise.py                  # Noise generation utilities
 │
 ├── evaluation_results/           # Experimental results organized by:
@@ -227,6 +232,37 @@ The `--parallel` argument controls the number of concurrent processes. A higher 
 ```
 # Run 8 experiments in parallel
 python run_master.py --parallel 8
+```
+
+### 💰 Budgeted ("principal investigator") mode
+
+Add `--budget` to any runner (`run_experiments.py`, `run_all_evaluations.py`,
+`run_master.py`), or set `NEWTONBENCH_BUDGET=1`, to give the agent a finite
+research grant: every `<run_experiment>` call is billed, the cost model is
+explained in the prompts (fixed setup fee + per–data-point cost + a `"precision"`
+surcharge + an exotic-parameter-range surcharge), and every `<experiment_output>`
+reports the funds remaining. It tests whether a model plans its experimental
+campaign the way a lab lead has to. Without the flag, cost tracking is off and
+the standard `evaluation_results/` tree is used.
+
+`"precision"` (an optional integer 1–5 the agent adds to a parameter set) buys a
+better sensor: the reading is rounded to more significant figures — meaningful
+**even at zero noise** — and, under noise, more replicate samples are averaged.
+
+Note: independent of `--budget`, all runs are now bounded by
+`configs/experiment_limits.json` (max data points per `<run_experiment>` call and
+per trial) so one trial can't balloon its runtime or context. Raise those values
+to restore the old unbounded behaviour.
+
+All cost values live in **`configs/budget/budget.json`** (per-module overrides
+supported) — no prompt text or experiment code needs editing. Budgeted runs are
+written to a separate tree (`budget_evaluation_results/` by default); score them
+with `--result_dir budget_evaluation_results`. See
+[`configs/budget/README.md`](configs/budget/README.md).
+
+```
+python run_experiments.py --module m11_heat_transfer --model_name gpt41mini --budget
+python analysis/scoreboard.py --model gpt41mini --result_dir budget_evaluation_results
 ```
 
 ### 📈 Analyzing Results

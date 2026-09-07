@@ -3,6 +3,8 @@ import time
 from typing import Dict, List, Any, Optional
 from .code_executor import CodeExecutor
 from .call_llm_api import call_llm_api
+from .budget import BudgetTracker
+from .limits import ExperimentLimits
 import re
 
 
@@ -13,7 +15,8 @@ def conduct_code_assisted_exploration(
     difficulty: str,
     system: str,
     law_version: str = None,
-    trial_info: Dict[str, Any] = None
+    trial_info: Dict[str, Any] = None,
+    budget: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Conduct physics discovery exploration using code assistant with per-turn Python call limits.
@@ -42,17 +45,25 @@ def conduct_code_assisted_exploration(
     )
 
     max_turns = 10  # Limit to prevent infinite loops
+    limits = ExperimentLimits.load()
     # Create code assisted agent-specific system prompt
     system_prompt = create_code_assisted_system_prompt(module, difficulty, system, max_turns)
-    
+    system_prompt = system_prompt + "\n\n" + limits.note()
+    if budget is not None:
+        system_prompt = system_prompt + "\n\n" + budget.system_note()
+
     # Initialize conversation with just the system prompt
     messages = [
         {"role": "system", "content": system_prompt}
     ]
-    
+
     # Add the task prompt as the first user message
     task_prompt = module.get_task_prompt(system, is_code_assisted=True, noise_level=noise_level)
+    if budget is not None:
+        task_prompt = task_prompt + "\n\n" + budget.cost_explanation()
     messages.append({"role": "user", "content": task_prompt})
+
+    budget_tracker = BudgetTracker(budget) if budget is not None else None
     
     # Initialize chat history with the system and task prompts
     chat_history = [
@@ -61,6 +72,7 @@ def conduct_code_assisted_exploration(
     ]
     total_tokens = 0
     num_experiments = 0
+    datapoints_used = 0  # data points measured so far this trial (capped by limits)
     python_tags_used_total = 0  # Counter for Python tags across entire trial
     
     # Extract trial identifier for logging
@@ -180,18 +192,50 @@ def conduct_code_assisted_exploration(
                     # Check if we need to run experiments
                     if response and "<run_experiment>" in response and "</run_experiment>" in response:
                         print(f"[Code Assisted Trial {trial_id}] Running experiment {num_experiments} in turn {turn + 1}")
-                        
+
+                        # Enforce the mission-wide and per-request data-point caps.
+                        requested = parse_run_experiment_list(response) or []
+                        requested_n = len(requested)
+                        remaining_allowance = limits.max_datapoints_per_trial - datapoints_used
+
+                        if remaining_allowance <= 0:
+                            cap_msg = (f"You have reached the mission limit of "
+                                       f"{limits.max_datapoints_per_trial} data points. No further experiments "
+                                       f"can be run. Submit your final law now using the <final_law> tag.")
+                            if messages and messages[-1]["role"] == "user":
+                                messages[-1]["content"] += "\n\n" + cap_msg
+                                chat_history[-1]["content"] += "\n\n" + cap_msg
+                            else:
+                                messages.append({"role": "user", "content": cap_msg})
+                                chat_history.append({"role": "user", "content": cap_msg})
+                            turn_completed = True
+                            break
+
+                        cap = min(limits.max_datapoints_per_request, remaining_allowance)
+
                         # Extract experiment parameters and run experiment
-                        experiment_result = run_experiment_from_response(module, response, system, noise_level, difficulty, law_version)
-                        
+                        charges_before = budget_tracker.num_charges if budget_tracker is not None else 0
+                        experiment_result = run_experiment_from_response(
+                            module, response, system, noise_level, difficulty, law_version,
+                            budget=budget, budget_tracker=budget_tracker, max_datapoints=cap,
+                        )
+
                         if experiment_result:
                             # Add experiment results to conversation
-                            if isinstance(experiment_result, list):
-                                num_experiments += len(experiment_result)
-                            else:
-                                num_experiments += 1
+                            got_n = len(experiment_result) if isinstance(experiment_result, list) else 1
+                            num_experiments += got_n
+                            datapoints_used += got_n
 
                             experiment_message = format_experiment_results(experiment_result)
+                            if got_n < requested_n:
+                                experiment_message += (
+                                    f"\n**Note:** only the first {got_n} of {requested_n} requested data points "
+                                    f"were measured (per-request cap {limits.max_datapoints_per_request}, "
+                                    f"{remaining_allowance} left this mission).")
+                            if budget_tracker is not None:
+                                last_cost = (budget_tracker.history[-1]["amount"]
+                                             if budget_tracker.num_charges > charges_before else None)
+                                experiment_message += "\n" + budget_tracker.status_line(last_cost)
                             if messages and messages[-1]["role"] == "user":
                                 messages[-1]["content"] += "\n\n" + experiment_message
                                 chat_history[-1]["content"] += "\n\n" + f"[Experiment Results]\n{experiment_message}"
@@ -273,7 +317,8 @@ def conduct_code_assisted_exploration(
         "total_tokens": total_tokens,
         "python_tags_used_total": python_tags_used_total,
         "num_experiments": num_experiments,
-        "exploration_mode": "code_assisted_agent"
+        "exploration_mode": "code_assisted_agent",
+        "budget": budget_tracker.summary() if budget_tracker is not None else None
     }
 
 def create_code_assisted_system_prompt(module, difficulty: str, system: str, max_turns: int) -> str:
@@ -339,10 +384,34 @@ You can perform experiments to gather data but you must follow the protocol stri
 
     return code_assisted_system_prompt
 
-def run_experiment_from_response(module, response: str, system: str, noise_level: float, difficulty: str, law_version: str = None) -> Optional[Dict[str, Any]]:
+def parse_run_experiment_list(response: str):
+    """Return the parsed JSON payload of the last <run_experiment> block as a list
+    (a lone object is wrapped), or None if it can't be parsed."""
+    if not response:
+        return None
+    start_tag, end_tag = '<run_experiment>', '</run_experiment>'
+    start_index = response.rfind(start_tag)
+    if start_index == -1:
+        return None
+    end_index = response.find(end_tag, start_index)
+    if end_index == -1:
+        return None
+    content = response[start_index + len(start_tag):end_index].strip()
+    try:
+        exp_data = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(exp_data, list):
+        return exp_data
+    if isinstance(exp_data, dict):
+        return [exp_data]
+    return None
+
+
+def run_experiment_from_response(module, response: str, system: str, noise_level: float, difficulty: str, law_version: str = None, budget: Optional[Any] = None, budget_tracker: Optional[Any] = None, max_datapoints: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """
     Extract experiment parameters from LLM response and run experiment.
-    
+
     Args:
         module: The physics module
         response: LLM response containing experiment request
@@ -350,70 +419,43 @@ def run_experiment_from_response(module, response: str, system: str, noise_level
         noise_level: Noise level for experiments
         difficulty: Difficulty level
         law_version: Law version to use
-        
+        max_datapoints: If set, only the first N parameter sets in the request are run.
+
     Returns:
         Experiment results or None if extraction failed
     """
     try:
-        # Parse the <run_experiment> block from the response
-        import re
-        import json
-        
-        # Extract content between <run_experiment> tags
-        start_tag = '<run_experiment>'
-        end_tag = '</run_experiment>'
+        experiments = parse_run_experiment_list(response)
+        if not experiments or not hasattr(module, 'run_experiment_for_module'):
+            return None
 
-        if response is None:
-            return None
-        
-        start_index = response.rfind(start_tag)
-        if start_index == -1:
-            return None
-            
-        end_index = response.find(end_tag, start_index)
-        if end_index == -1:
-            return None
-                    
-        try:
-            # Parse the JSON content
-            content = response[start_index + len(start_tag):end_index].strip()
-            exp_data = json.loads(content)
-            
-            # Handle both single experiment and array of experiments
-            if isinstance(exp_data, list):
-                # Multiple experiments
-                results = []
-                for exp in exp_data:
-                    if hasattr(module, 'run_experiment_for_module'):
-                        result = module.run_experiment_for_module(
-                            **exp, 
-                            noise_level=noise_level, 
-                            difficulty=difficulty,
-                            system=system,
-                            law_version=law_version
-                        )
-                        results.append(result)
-                    else:
-                        results.append(None)
-                return results
-            else:
-                # Single experiment
-                if hasattr(module, 'run_experiment_for_module'):
-                    result = module.run_experiment_for_module(
-                        **exp_data, 
-                        noise_level=noise_level, 
-                        difficulty=difficulty,
-                        system=system,
-                        law_version=law_version
-                    )
-                    return result
-                else:
-                    return None
-                    
-        except json.JSONDecodeError:
-            return None
-            
-    except Exception as e:
+        if max_datapoints is not None and max_datapoints >= 0:
+            experiments = experiments[:max_datapoints]
+            if not experiments:
+                return None
+
+        # Budgeted path: price the batch, charge the grant, strip the
+        # 'precision' field, and take (sig-fig-quantised, replicate-averaged)
+        # measurements.
+        if budget is not None and budget_tracker is not None:
+            pricing = budget.price_batch(experiments)
+            budget_tracker.charge(pricing.total_cost, {"num_points": len(experiments),
+                                                       "precisions": pricing.precisions})
+            return [
+                budget.measure(module, exp, precision, noise_level=noise_level,
+                               difficulty=difficulty, system=system, law_version=law_version)
+                for exp, precision in zip(pricing.cleaned_experiments, pricing.precisions)
+            ]
+
+        return [
+            module.run_experiment_for_module(
+                **exp, noise_level=noise_level, difficulty=difficulty,
+                system=system, law_version=law_version,
+            )
+            for exp in experiments
+        ]
+
+    except Exception:
         return None
 
 def format_experiment_results(experiment_result: Any) -> str:

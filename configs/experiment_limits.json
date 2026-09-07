@@ -1,0 +1,6 @@
+{
+  "_comment": "Hard caps on experiment volume, applied to EVERY run (budgeted or not) so a trial cannot balloon its runtime or blow the context window. Data only -- no prompt text or code. Set a value very high to effectively disable that cap.",
+
+  "max_datapoints_per_request": 20,
+  "max_datapoints_per_trial": 200
+}
