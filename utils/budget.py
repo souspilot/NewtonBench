@@ -38,13 +38,14 @@ _BUILTIN_DEFAULTS: Dict[str, Any] = {
     "results_dir": "budget_evaluation_results",
     "currency": "$",
     "defaults": {
-        "starting_funds": 10000.0,
+        "starting_funds": 2000.0,
+        "min_spend_fraction": 0.5,
         "cost_model": {
             "request_fee": 50.0,
             "per_datapoint_cost": 10.0,
             "default_precision": 1,
             "precision_multipliers": {"1": 1.0, "2": 1.6, "3": 2.5, "4": 4.0, "5": 6.5},
-            "precision_sig_figs": {"1": 3, "2": 4, "3": 6, "4": 9, "5": 15},
+            "precision_sig_figs": {"1": 1, "2": 2, "3": 3, "4": 4, "5": 6},
             "magnitude_surcharge": {
                 "reference_low": 1e-3,
                 "reference_high": 1e3,
@@ -110,7 +111,8 @@ class BudgetConfig:
         return ModuleBudget(
             module_name=module_name,
             currency=self.currency,
-            starting_funds=float(merged.get("starting_funds", 10000.0)),
+            starting_funds=float(merged.get("starting_funds", 2000.0)),
+            min_spend_fraction=float(merged.get("min_spend_fraction", 0.5)),
             request_fee=float(cm.get("request_fee", 50.0)),
             per_datapoint_cost=float(cm.get("per_datapoint_cost", 10.0)),
             default_precision=int(cm.get("default_precision", 1)),
@@ -136,6 +138,7 @@ class ModuleBudget:
     module_name: str
     currency: str
     starting_funds: float
+    min_spend_fraction: float
     request_fee: float
     per_datapoint_cost: float
     default_precision: int
@@ -233,8 +236,12 @@ class ModuleBudget:
         return _round_to_sig_figs(value, self.sig_figs(precision))
 
     # ---- prompt text (generated from the numbers above) ------------------
+    def min_spend_amount(self) -> float:
+        return self.starting_funds * self.min_spend_fraction
+
     def system_note(self) -> str:
         c = self.currency
+        pct = int(self.min_spend_fraction * 100)
         return (
             "**Research budget:** This mission is *budgeted*. You are the principal "
             "investigator on a grant with finite funds. Every `<run_experiment>` call "
@@ -243,7 +250,12 @@ class ModuleBudget:
             f"but every {c} spent past zero is recorded and counts against you. Plan "
             "your experimental campaign the way a real lab lead must: batch measurements, "
             "buy precision only where it changes your conclusion, and keep enough in "
-            "reserve to finish."
+            "reserve to finish.\n\n"
+            f"**Minimum spend rule:** You must spend at least {pct}% of your starting "
+            f"funds ({c}{self.min_spend_amount():,.0f}) before submitting your "
+            "`<final_law>`. Early submissions will be rejected. Use the budget to "
+            "thoroughly explore the parameter space, verify your hypotheses with "
+            "higher-precision measurements, and test edge cases."
         )
 
     def cost_explanation(self) -> str:
@@ -254,6 +266,7 @@ class ModuleBudget:
             + ("   (default)" if k == self.default_precision else "")
             for k in sorted(pm)
         )
+        pct = int(self.min_spend_fraction * 100)
         lines = [
             "**How experiments are billed (this run only):**",
             f"- Fixed setup fee: {c}{self.request_fee:g} per `<run_experiment>` call, whatever its size.",
@@ -269,6 +282,8 @@ class ModuleBudget:
             f"[{self.ref_low:g}, {self.ref_high:g}] adds {self.frac_per_decade * 100:g}% to that data point's "
             f"cost per order of magnitude beyond the window (specialised apparatus).",
             f"- Starting funds for this mission: {c}{self.starting_funds:g}.",
+            f"- **Minimum spend:** You must use at least {pct}% of your budget "
+            f"({c}{self.min_spend_amount():,.0f}) before you can submit `<final_law>`.",
         ]
         if self.notes:
             lines.append(f"- Note: {self.notes}")
@@ -344,6 +359,25 @@ class BudgetTracker:
         self.overdraft = 0.0          # max amount the balance has ever been below zero
         self.num_charges = 0
         self.history: List[Dict[str, Any]] = []
+
+    def meets_min_spend(self) -> bool:
+        """True if the agent has spent at least the required fraction of the budget."""
+        return self.spent >= self.mb.min_spend_amount()
+
+    def min_spend_rejection(self) -> str:
+        """Message returned when the agent tries to submit before meeting the minimum spend."""
+        c = self.currency
+        pct = int(self.mb.min_spend_fraction * 100)
+        needed = self.mb.min_spend_amount()
+        shortfall = needed - self.spent
+        return (
+            f"**Submission rejected:** You have only spent {c}{self.spent:,.0f} of your "
+            f"{c}{self.mb.starting_funds:,.0f} budget. You must spend at least {pct}% "
+            f"({c}{needed:,.0f}) before submitting your final law. You still need to "
+            f"spend {c}{shortfall:,.0f} more. Continue experimenting — explore additional "
+            "parameter ranges, buy higher-precision measurements to refine your constants, "
+            "or test edge cases to verify your hypothesis."
+        )
 
     def charge(self, amount: float, meta: Optional[Dict[str, Any]] = None) -> None:
         amount = round(float(amount), 4)

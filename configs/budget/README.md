@@ -44,6 +44,7 @@ agent-facing explanation is generated from these numbers by `utils/budget.py`.
 | `results_dir` | Directory tree for budgeted runs. |
 | `currency` | Symbol shown in prompts / logs. |
 | `defaults.starting_funds` | Grant size per trial. |
+| `defaults.min_spend_fraction` | Fraction of starting funds (0–1) the agent must spend before it can submit `<final_law>`. Submissions before this threshold are rejected with a message telling the agent to keep experimenting. |
 | `defaults.cost_model.request_fee` | Fixed charge per `<run_experiment>` call, any size. |
 | `defaults.cost_model.per_datapoint_cost` | Charge per parameter set in the JSON array. |
 | `defaults.cost_model.default_precision` | Precision assumed when the agent omits the field. |
