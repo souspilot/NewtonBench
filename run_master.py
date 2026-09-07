@@ -75,6 +75,7 @@ def build_commands(
     full: bool = False,
     subset_file: str = "",
     trials_per_law: int = 0,
+    budget: bool = False,
 ) -> List[List[str]]:
     run_all = repo_root / "run_all_evaluations.py"
     if not run_all.exists():
@@ -100,6 +101,8 @@ def build_commands(
                     cmd.extend(["--subset_file", subset_file])
                 if trials_per_law:
                     cmd.extend(["--trials_per_law", str(trials_per_law)])
+                if budget:
+                    cmd.append("--budget")
                 commands.append(cmd)
     return commands
 
@@ -247,6 +250,13 @@ def main():
              "so each configuration has slack for retries).",
     )
 
+    parser.add_argument(
+        "--budget",
+        action="store_true",
+        help="Enable budgeted 'principal investigator' mode for every run (passes --budget through to "
+             "run_all_evaluations.py). See configs/budget/README.md.",
+    )
+
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
@@ -264,6 +274,7 @@ def main():
     commands = build_commands(
         repo_root, modules, models,
         full=args.full, subset_file=args.subset_file, trials_per_law=args.trials_per_law,
+        budget=args.budget,
     )
 
     # Always show the commands before running

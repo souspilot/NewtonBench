@@ -1,10 +1,12 @@
 # utils/vanilla_agent.py
 
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import json
 
 from utils.call_llm_api import call_llm_api
+from utils.budget import BudgetTracker
+from utils.limits import ExperimentLimits
 
 # --- Base Prompt ---
 BASE_PROMPT = """You are an AI research assistant tasked with discovering scientific laws in a simulated universe.
@@ -95,7 +97,7 @@ def _call_llm_and_process_response(messages: List[Dict[str, str]], model_name: s
     messages.append({"role": "assistant", "content": combined_content})
     return messages, tokens, response_text
 
-def conduct_exploration(module: Any, model_name: str, noise_level: float, difficulty: str = 'easy', system: str = 'vanilla_equation', law_version: str = None, max_turns: int = 10, trial_info: Dict[str, Any] = None) -> Dict[str, Any]:
+def conduct_exploration(module: Any, model_name: str, noise_level: float, difficulty: str = 'easy', system: str = 'vanilla_equation', law_version: str = None, max_turns: int = 10, trial_info: Dict[str, Any] = None, budget: Optional[Any] = None) -> Dict[str, Any]:
     """
     Manages the iterative exploration process with the LLM.
 
@@ -111,14 +113,25 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
     Returns:
         A dictionary containing the results of the exploration.
     """
+    limits = ExperimentLimits.load()
+
     base_prompt = BASE_PROMPT.format(max_turns=max_turns)
+    base_prompt = base_prompt + "\n\n" + limits.note()
+    if budget is not None:
+        base_prompt = base_prompt + "\n\n" + budget.system_note()
     if "nemotron" in model_name:
         base_prompt = "detailed thinking on \n" + base_prompt
     messages = [{"role": "system", "content": base_prompt}]
-    messages.append({"role": "user", "content": module.get_task_prompt(system, noise_level=noise_level)})
-    
+
+    task_prompt = module.get_task_prompt(system, noise_level=noise_level)
+    if budget is not None:
+        task_prompt = task_prompt + "\n\n" + budget.cost_explanation()
+    messages.append({"role": "user", "content": task_prompt})
+
+    budget_tracker = BudgetTracker(budget) if budget is not None else None
     total_tokens = 0
     num_experiments_run = 0
+    datapoints_used = 0
 
     for turn in range(max_turns):
         messages, tokens, response_text = _call_llm_and_process_response(messages, model_name, trial_info)
@@ -134,24 +147,66 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
                 "rounds": turn + 1,
                 "total_tokens": total_tokens,
                 "num_experiments": num_experiments_run,
-                "chat_history": messages
+                "chat_history": messages,
+                "budget": budget_tracker.summary() if budget_tracker is not None else None
             }
 
         # Check for experiment request
         experiments_to_run = parse_experiment_request(response_text if response_text is not None else "")
         
         if experiments_to_run:
+            # Enforce the mission-wide and per-request data-point caps.
+            remaining_allowance = limits.max_datapoints_per_trial - datapoints_used
+            if remaining_allowance <= 0:
+                messages.append({"role": "user", "content": (
+                    f"You have reached the mission limit of {limits.max_datapoints_per_trial} data points. "
+                    "No further experiments can be run. Submit your final law now using the <final_law> tag.")})
+                continue
+
+            requested_n = len(experiments_to_run)
+            cap = min(limits.max_datapoints_per_request, remaining_allowance)
+            experiments_to_run = experiments_to_run[:cap]
+            dropped = requested_n - len(experiments_to_run)
+
             num_experiments_run += len(experiments_to_run)
+            datapoints_used += len(experiments_to_run)
+
+            last_cost = None
+            if budget_tracker is not None:
+                pricing = budget.price_batch(experiments_to_run)
+                budget_tracker.charge(pricing.total_cost, {"num_points": len(experiments_to_run),
+                                                           "precisions": pricing.precisions})
+                last_cost = pricing.total_cost
+                exps_for_run = pricing.cleaned_experiments
+                precisions = pricing.precisions
+            else:
+                exps_for_run = experiments_to_run
+                precisions = [None] * len(experiments_to_run)
+
             results = []
-            for exp in experiments_to_run:
+            for exp, precision in zip(exps_for_run, precisions):
                 # Pass system and law_version to run_experiment_for_module
-                result = module.run_experiment_for_module(**exp, noise_level=noise_level, difficulty=difficulty, system=system, law_version=law_version)
-                if system == "vanilla_equation":
-                    result = "{:.15e}".format(result)            
+                if budget_tracker is not None:
+                    result = budget.measure(module, exp, precision, noise_level=noise_level,
+                                            difficulty=difficulty, system=system, law_version=law_version)
+                    if system == "vanilla_equation":
+                        sig = budget.sig_figs(precision)
+                        result = f"{result:.{max(sig - 1, 0)}e}"
+                else:
+                    result = module.run_experiment_for_module(**exp, noise_level=noise_level, difficulty=difficulty, system=system, law_version=law_version)
+                    if system == "vanilla_equation":
+                        result = "{:.15e}".format(result)
                 results.append(result)
 
             # Format results for the LLM as JSON
             output_str = f"<experiment_output>\n{json.dumps(results)}\n</experiment_output>"
+            if dropped > 0:
+                output_str += (f"\n**Note:** only the first {len(experiments_to_run)} of {requested_n} "
+                               f"requested data points were measured (per-request cap "
+                               f"{limits.max_datapoints_per_request}, "
+                               f"{remaining_allowance} left this mission).")
+            if budget_tracker is not None:
+                output_str += "\n" + budget_tracker.status_line(last_cost)
             messages.append({"role": "user", "content": output_str})
         else:
             # If no valid action, prompt the LLM to act
@@ -173,5 +228,6 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
         "rounds": max_turns,
         "total_tokens": total_tokens,
         "num_experiments": num_experiments_run,
-        "chat_history": messages
+        "chat_history": messages,
+        "budget": budget_tracker.summary() if budget_tracker is not None else None
     }
