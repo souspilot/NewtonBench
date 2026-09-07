@@ -30,6 +30,7 @@ import argparse
 import importlib
 import json
 import os
+import sys
 import glob
 import numpy as np
 import traceback
@@ -102,7 +103,10 @@ def main():
                         help=f"LLM model to use as judge (default: '{PAPER_JUDGE_MODEL}', matching what "
                              f"upstream run_experiments.py / the paper's Table 2 and Appendix B.1 used -- "
                              f"pass a different value only if you deliberately want a non-paper-comparable judge).")
-    parser.add_argument("--base-dir", default="evaluation_results")
+    parser.add_argument("--base-dir", default=None,
+                        help="default: evaluation_results, or the budgeted tree when --budget is set")
+    parser.add_argument("--budget", action="store_true",
+                        help="re-judge a budgeted run (read/write under the budget results tree)")
     parser.add_argument("--module", default=None, help="Restrict to one module")
     parser.add_argument("--agent", default=None, help="Restrict to one agent backend")
     parser.add_argument("--dry-run", action="store_true", help="Just count trials, don't re-judge")
@@ -111,6 +115,17 @@ def main():
     parser.add_argument("--output-suffix", default=None,
                         help="Suffix for output dir (default: judge model name)")
     args = parser.parse_args()
+
+    if args.base_dir is None:
+        if args.budget:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            try:
+                from utils.budget import load_budget_config
+                args.base_dir = load_budget_config().results_dir
+            except Exception:
+                args.base_dir = "budget_evaluation_results"
+        else:
+            args.base_dir = "evaluation_results"
 
     model_dir = Path(args.base_dir) / args.model
     if not model_dir.exists():
