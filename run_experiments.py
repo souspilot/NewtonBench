@@ -274,51 +274,76 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
         m = re.match(r'trial(\d+)', os.path.basename(path))
         return int(m.group(1)) if m else -1
 
-    next_trial_id = max(
-        (_trial_index(p) for p in glob.glob(os.path.join(trials_dir, "trial*.json"))),
-        default=-1,
-    ) + 1
+    def _load_valid_trial(path):
+        """Parsed trial dict, or None if the file is unreadable / truncated /
+        missing the fields aggregation needs (e.g. killed mid-write)."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                obj = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+        if isinstance(obj, dict) and isinstance(obj.get("evaluation"), dict) \
+                and "rmsle" in obj["evaluation"] and "trial_id" in obj:
+            return obj
+        return None
+
+    existing_trial_files = glob.glob(os.path.join(trials_dir, "trial*.json"))
+    next_trial_id = max((_trial_index(p) for p in existing_trial_files), default=-1) + 1
+
+    # Only ever run the shortfall to TARGET_SUCCESSFUL_TRIALS. Successful trials
+    # beyond that get superseded straight after, so running them is pure waste --
+    # and this is what makes resuming an interrupted run cheap: it tops the config
+    # up to the target and stops, instead of re-running the whole batch.
+    existing_success = sum(
+        1 for p in existing_trial_files
+        if not p.endswith("_fail.json") and _load_valid_trial(p) is not None
+    )
+    requested_trials = num_trials
+    if not getattr(cli_args, "force", False):
+        num_trials = max(0, min(num_trials, TARGET_SUCCESSFUL_TRIALS - existing_success))
+        if num_trials < requested_trials:
+            print(f"{existing_success} successful trial(s) already on disk (target "
+                  f"{TARGET_SUCCESSFUL_TRIALS}); running {num_trials} more instead of {requested_trials}. "
+                  f"Pass --force to run all {requested_trials} regardless.")
 
     start_time = time.time()
-    
+
     max_retries = 3
     judge_model_name = cli_args.model_name # HACK for API poor researchers :-(
-    
+
     pool_args = [
         (i, cli_args.noise, cli_args.model_name, cli_args.module, cli_args.equation_difficulty, cli_args.model_system, law_version, trials_dir, max_retries, judge_model_name, cli_args.agent_backend, budget_mode)
         for i in range(next_trial_id, next_trial_id + num_trials)
     ]
-    
-    # Run trials with dynamic batch processing based on CPU count
-    actual_cpu_count = cpu_count()
-    batch_size = min(actual_cpu_count, cli_args.trials)
 
-    # Run trials with fixed batch processing 
-    # batch_size = 6  # Fixed batch size
-    num_batches = (num_trials + batch_size - 1) // batch_size
-    
-    # print(f"CPU Count: {actual_cpu_count}")
-    print(f"Batch Size: {batch_size}")
-    print(f"Number of Processes: {batch_size}")
-    print(f"Number of Batches: {num_batches}")
-    print(f"Total Trials: {num_trials}")
-    
     results = []
-    
-    for batch_num in range(num_batches):
-        start_idx = batch_num * batch_size
-        end_idx = min(start_idx + batch_size, num_trials)
-        batch_args = pool_args[start_idx:end_idx]
-        
-        actual_batch_size = len(batch_args)
-        
-        print(f"Processing batch {batch_num + 1}/{num_batches} (trials {start_idx + 1}-{end_idx}) with {actual_batch_size} processes")
-        
-        with Pool(processes=actual_batch_size) as pool:
-            batch_results = pool.map(run_trial, batch_args)
-            results.extend(batch_results)
-        
-        print(f"Completed batch {batch_num + 1}/{num_batches}")
+    if num_trials > 0:
+        # Run trials with dynamic batch processing based on CPU count
+        actual_cpu_count = cpu_count()
+        batch_size = min(actual_cpu_count, num_trials)
+        num_batches = (num_trials + batch_size - 1) // batch_size
+
+        print(f"Batch Size: {batch_size}")
+        print(f"Number of Processes: {batch_size}")
+        print(f"Number of Batches: {num_batches}")
+        print(f"Total Trials: {num_trials}")
+
+        for batch_num in range(num_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, num_trials)
+            batch_args = pool_args[start_idx:end_idx]
+
+            actual_batch_size = len(batch_args)
+
+            print(f"Processing batch {batch_num + 1}/{num_batches} (trials {start_idx + 1}-{end_idx}) with {actual_batch_size} processes")
+
+            with Pool(processes=actual_batch_size) as pool:
+                batch_results = pool.map(run_trial, batch_args)
+                results.extend(batch_results)
+
+            print(f"Completed batch {batch_num + 1}/{num_batches}")
+    else:
+        print("No new trials needed; re-aggregating existing results on disk.")
 
     end_time = time.time()
 
@@ -327,27 +352,41 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     # runs), keep the most recent TARGET_SUCCESSFUL_TRIALS successful ones for
     # analysis and move the rest into trials/superseded/. Failed trials are kept
     # in place for failure-mode analysis but never counted as successes.
-    def _load_json(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-
-    success_files = sorted(
-        (p for p in glob.glob(os.path.join(trials_dir, "trial*.json"))
-         if not p.endswith("_fail.json")),
-        key=os.path.getmtime,
-    )
-    if len(success_files) > TARGET_SUCCESSFUL_TRIALS:
-        superseded_dir = os.path.join(trials_dir, "superseded")
-        os.makedirs(superseded_dir, exist_ok=True)
-        for p in success_files[:-TARGET_SUCCESSFUL_TRIALS]:
-            chat_log = re.sub(r'\.json$', '_chat_history.log', p)
-            for src in (p, chat_log):
+    def _move_aside(paths, subdir):
+        dest = os.path.join(trials_dir, subdir)
+        os.makedirs(dest, exist_ok=True)
+        for p in paths:
+            for src in (p, re.sub(r'\.json$', '_chat_history.log', p)):
                 if os.path.exists(src):
-                    os.replace(src, os.path.join(superseded_dir, os.path.basename(src)))
-        success_files = success_files[-TARGET_SUCCESSFUL_TRIALS:]
+                    os.replace(src, os.path.join(dest, os.path.basename(src)))
 
-    valid_results = [_load_json(p) for p in success_files]
-    failed_results = [_load_json(p) for p in glob.glob(os.path.join(trials_dir, "trial*_fail.json"))]
+    # Parse every candidate success file up front. A file truncated by a hard
+    # kill mid-write (or otherwise missing required fields) is quarantined to
+    # trials/corrupt/ rather than left to crash aggregation on every future resume.
+    parsed, corrupt = [], []
+    for p in sorted((p for p in glob.glob(os.path.join(trials_dir, "trial*.json"))
+                     if not p.endswith("_fail.json")),
+                    key=os.path.getmtime):
+        obj = _load_valid_trial(p)
+        (parsed.append((p, obj)) if obj is not None else corrupt.append(p))
+    if corrupt:
+        _move_aside(corrupt, "corrupt")
+        print(f"WARNING: quarantined {len(corrupt)} unreadable/incomplete trial file(s) to "
+              f"{os.path.join(trials_dir, 'corrupt')}: {[os.path.basename(p) for p in corrupt]}")
+
+    if len(parsed) > TARGET_SUCCESSFUL_TRIALS:
+        _move_aside([p for p, _ in parsed[:-TARGET_SUCCESSFUL_TRIALS]], "superseded")
+        parsed = parsed[-TARGET_SUCCESSFUL_TRIALS:]
+
+    valid_results = [d for _, d in parsed]
+    failed_results = []
+    for p in glob.glob(os.path.join(trials_dir, "trial*_fail.json")):
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                failed_results.append(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            print(f"WARNING: skipping unreadable fail file {os.path.basename(p)}")
+
     all_results = valid_results + failed_results
 
     if not valid_results:
@@ -486,6 +525,10 @@ if __name__ == "__main__":
                       help="Specific law version to use, 'all' for all versions, or None for random selection or a specific version (e.g. v0, v1, v2)")
     parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
                       help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
+    parser.add_argument("--force", action="store_true",
+                      help="Run exactly --trials new trials even if the config already has enough successful "
+                           "trials on disk. Without this, a run tops the config up to the target "
+                           f"({TARGET_SUCCESSFUL_TRIALS}) and stops, so resuming an interrupted run is cheap.")
     parser.add_argument("--budget", action="store_true",
                       help="Enable budgeted 'principal investigator' mode: every <run_experiment> call is billed "
                            "against a finite grant, the cost model is explained in the prompts, and each "

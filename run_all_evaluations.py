@@ -516,6 +516,10 @@ def main():
         ]
         if budget_mode:
             command.append("--budget")
+        # --force_rerun should produce fresh trials even for already-complete
+        # configs, so bypass run_experiments.py's top-up cap.
+        if args.force_rerun:
+            command.append("--force")
 
         print(f"Command: {' '.join(command)}")
         
