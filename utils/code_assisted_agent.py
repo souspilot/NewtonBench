@@ -133,6 +133,12 @@ def conduct_code_assisted_exploration(
                 
                 # Check if LLM has submitted final law
                 if response and "<final_law>" in response and "</final_law>" in response:
+                    if budget_tracker is not None and not budget_tracker.meets_min_spend():
+                        rejection = budget_tracker.min_spend_rejection()
+                        print(f"[Code Assisted Trial {trial_id}] Final law rejected: minimum spend not met")
+                        chat_history.append({"role": "user", "content": rejection})
+                        messages.append({"role": "user", "content": rejection})
+                        break
                     print(f"[Code Assisted Trial {trial_id}] Final law submitted on turn {turn + 1}")
                     trial_completed = True
                     turn_completed = True

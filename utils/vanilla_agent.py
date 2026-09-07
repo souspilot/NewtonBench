@@ -141,6 +141,9 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
         # Check for final law submission
         is_submitted, submitted_law = _extract_final_law(response_text, module.FUNCTION_SIGNATURE)
         if is_submitted:
+            if budget_tracker is not None and not budget_tracker.meets_min_spend():
+                messages.append({"role": "user", "content": budget_tracker.min_spend_rejection()})
+                continue
             return {
                 "status": "completed",
                 "submitted_law": submitted_law,
