@@ -213,6 +213,29 @@ def conduct_code_assisted_exploration(
 
                         cap = min(limits.max_datapoints_per_request, remaining_allowance)
 
+                        # Budget hard cap: reject if experiment exceeds remaining funds.
+                        if budget is not None and budget_tracker is not None and requested:
+                            capped_exps = requested[:cap]
+                            pricing = budget.price_batch(capped_exps)
+                            if budget_tracker.would_exceed(pricing.total_cost):
+                                rejection = budget_tracker.reject(pricing)
+                                if messages and messages[-1]["role"] == "user":
+                                    messages[-1]["content"] += "\n\n" + rejection
+                                    chat_history[-1]["content"] += "\n\n" + rejection
+                                else:
+                                    messages.append({"role": "user", "content": rejection})
+                                    chat_history.append({"role": "user", "content": rejection})
+                                if budget_tracker.must_submit():
+                                    submit_msg = "Submit your final law now using the <final_law> tag."
+                                    if messages and messages[-1]["role"] == "user":
+                                        messages[-1]["content"] += "\n\n" + submit_msg
+                                        chat_history[-1]["content"] += "\n\n" + submit_msg
+                                    else:
+                                        messages.append({"role": "user", "content": submit_msg})
+                                        chat_history.append({"role": "user", "content": submit_msg})
+                                turn_completed = True
+                                break
+
                         # Extract experiment parameters and run experiment
                         charges_before = budget_tracker.num_charges if budget_tracker is not None else 0
                         experiment_result = run_experiment_from_response(
