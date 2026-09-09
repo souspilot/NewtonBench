@@ -281,8 +281,10 @@ class ModuleBudget:
             "**Research budget:** This mission is *budgeted*. You are the principal "
             "investigator on a grant with finite funds. Every `<run_experiment>` call "
             "is billed against the grant, and every `<experiment_output>` tells you the "
-            f"funds remaining (in {c}). Running out of money does not end the mission, "
-            f"but every {c} spent past zero is recorded and counts against you. Plan "
+            f"funds remaining (in {c}). **An experiment whose cost exceeds your remaining "
+            "funds will be rejected** — you will be told the cost and shortfall, and must "
+            "revise or submit your final law. Two consecutive rejected experiments will "
+            "end your experimental campaign and require immediate submission. Plan "
             "your experimental campaign the way a real lab lead must: choose batch sizes "
             "carefully, buy precision only where it changes your conclusion, and keep "
             "enough in reserve to verify before you submit."
@@ -387,7 +389,9 @@ def _round_to_sig_figs(value: Any, sig: int) -> Any:
 
 
 class BudgetTracker:
-    """Running grant balance for one trial. Overdraft is allowed and recorded."""
+    """Running grant balance for one trial. Hard cap: experiments that exceed
+    remaining funds are rejected (not charged). Two consecutive rejections
+    force the agent to submit its final law immediately."""
 
     def __init__(self, module_budget: ModuleBudget):
         self.mb = module_budget
@@ -397,13 +401,48 @@ class BudgetTracker:
         self.spent = 0.0
         self.overdraft = 0.0          # max amount the balance has ever been below zero
         self.num_charges = 0
+        self.consecutive_rejections = 0
+        self.total_rejections = 0
         self.history: List[Dict[str, Any]] = []
+
+    def would_exceed(self, amount: float) -> bool:
+        return round(float(amount), 4) > round(self.remaining, 4)
+
+    def reject(self, pricing: "BatchPricing") -> str:
+        """Record a rejection and return the message to show the agent."""
+        self.consecutive_rejections += 1
+        self.total_rejections += 1
+        c = self.currency
+        overage = round(pricing.total_cost - self.remaining, 2)
+        msg = (
+            f"**Experiment rejected — insufficient funds.**\n"
+            f"- Proposed cost: {c}{pricing.total_cost:,.2f}\n"
+            f"- Funds remaining: {c}{self.remaining:,.2f}\n"
+            f"- Shortfall: {c}{overage:,.2f}\n\n"
+        )
+        if self.consecutive_rejections >= 2:
+            msg += (
+                "You have exceeded your budget on two consecutive attempts. "
+                "Submit your final law now using the `<final_law>` tag."
+            )
+        else:
+            msg += (
+                "Revise your experiment to fit within the remaining budget. "
+                "Consider reducing the batch size, lowering precision, or "
+                "varying fewer parameters. If you have enough evidence, you "
+                "may submit your final law instead."
+            )
+        return msg
+
+    def must_submit(self) -> bool:
+        return self.consecutive_rejections >= 2
 
     def charge(self, amount: float, meta: Optional[Dict[str, Any]] = None) -> None:
         amount = round(float(amount), 4)
         self.spent = round(self.spent + amount, 4)
         self.remaining = round(self.remaining - amount, 4)
         self.num_charges += 1
+        self.consecutive_rejections = 0
         if self.remaining < 0:
             self.overdraft = round(max(self.overdraft, -self.remaining), 4)
         entry = {"amount": amount, "remaining": self.remaining}
@@ -432,5 +471,6 @@ class BudgetTracker:
             "overdraft": self.overdraft,
             "overspent": self.remaining < 0,
             "num_billed_requests": self.num_charges,
+            "total_rejections": self.total_rejections,
             "config_source": None,  # filled in by the caller if useful
         }

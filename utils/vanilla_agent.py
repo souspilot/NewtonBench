@@ -168,12 +168,21 @@ def conduct_exploration(module: Any, model_name: str, noise_level: float, diffic
             experiments_to_run = experiments_to_run[:cap]
             dropped = requested_n - len(experiments_to_run)
 
-            num_experiments_run += len(experiments_to_run)
-            datapoints_used += len(experiments_to_run)
-
             last_cost = None
             if budget_tracker is not None:
                 pricing = budget.price_batch(experiments_to_run)
+                if budget_tracker.would_exceed(pricing.total_cost):
+                    rejection = budget_tracker.reject(pricing)
+                    messages.append({"role": "user", "content": rejection})
+                    if budget_tracker.must_submit():
+                        messages.append({"role": "user", "content":
+                            "Submit your final law now using the <final_law> tag."})
+                    continue
+
+            num_experiments_run += len(experiments_to_run)
+            datapoints_used += len(experiments_to_run)
+
+            if budget_tracker is not None:
                 budget_tracker.charge(pricing.total_cost, {"num_points": len(experiments_to_run),
                                                            "precisions": pricing.precisions})
                 last_cost = pricing.total_cost
