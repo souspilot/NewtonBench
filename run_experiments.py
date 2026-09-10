@@ -38,6 +38,12 @@ try:
 except Exception:
     _WITH_PLANNED_AGENT = False
 
+try:
+    from utils.bayesian_agent import conduct_bayesian_exploration
+    _WITH_BAYESIAN_AGENT = True
+except Exception:
+    _WITH_BAYESIAN_AGENT = False
+
 def format_chat_history(chat_history):
     """Format chat history as a readable log file."""
     lines = []
@@ -140,6 +146,17 @@ def run_trial(args):
                 )
             elif agent_backend == "code_assisted_agent" and _WITH_CODE_ASSISTANCE:
                 exploration_result = conduct_code_assisted_exploration(
+                    module=module,
+                    model_name=model_name,
+                    noise_level=noise_level,
+                    difficulty=difficulty,
+                    system=system,
+                    law_version=law_version,
+                    trial_info=trial_info,
+                    budget=module_budget
+                )
+            elif agent_backend == "bayesian_agent" and _WITH_BAYESIAN_AGENT:
+                exploration_result = conduct_bayesian_exploration(
                     module=module,
                     model_name=model_name,
                     noise_level=noise_level,
@@ -523,8 +540,8 @@ if __name__ == "__main__":
                       help="Model system selected to test the agent: vanilla_equation, simple_system, complex_system")
     parser.add_argument("-l", "--law_version", type=str, default="all",
                       help="Specific law version to use, 'all' for all versions, or None for random selection or a specific version (e.g. v0, v1, v2)")
-    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
-                      help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use.")
+    parser.add_argument("-b", "--agent_backend", type=str, default="vanilla_agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent", "bayesian_agent"],
+                      help="Agent backend to use for exploration. Default is vanilla_agent. When code_assisted_agent is selected, LLM is equipped with <python> tool use. bayesian_agent is a non-LLM PySR baseline.")
     parser.add_argument("--force", action="store_true",
                       help="Run exactly --trials new trials even if the config already has enough successful "
                            "trials on disk. Without this, a run tops the config up to the target "

@@ -61,7 +61,7 @@ MAX_TURNS = 10  # every module's system prompt states "up to 10 rounds"
 DIFFICULTIES = ["easy", "medium", "hard"]
 SYSTEMS = ["vanilla_equation", "simple_system", "complex_system"]
 SYS_SHORT = {"vanilla_equation": "VanEq", "simple_system": "SimpS", "complex_system": "CompS"}
-AGENT_SHORT = {"vanilla_agent": "Vanilla", "code_assisted_agent": "CodeAst", "planned_agent": "Planned"}
+AGENT_SHORT = {"vanilla_agent": "Vanilla", "code_assisted_agent": "CodeAst", "planned_agent": "Planned", "bayesian_agent": "Bayesian"}
 MODULE_ORDER = [
     "m0_gravity", "m1_coulomb_force", "m2_magnetic_force", "m3_fourier_law",
     "m4_snell_law", "m5_radioactive_decay", "m6_underdamped_harmonic",

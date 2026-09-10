@@ -626,7 +626,7 @@ def main():
                             "verdicts_<model>_budget.csv, and add a budget-vs-outcome block to `trace`")
         p.add_argument("--subset_file", default=None,
                        help="representative_subset.json -- pin analysis to one cell set.")
-        p.add_argument("--agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
+        p.add_argument("--agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent", "bayesian_agent"],
                        default=None)
         p.add_argument("--module", default=None)
         p.add_argument("--rmsle_threshold", type=float, default=DEFAULT_RMSLE_THRESHOLD)
