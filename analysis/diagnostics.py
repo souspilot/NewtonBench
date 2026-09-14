@@ -11,11 +11,11 @@ Subcommands (all take --model, --result_dir, --subset_file, --agent, --module):
              verified_success label scoreboard.py picks up.
 
   mistakes   For trials with a resolved symbolic failure, classify HOW
-             classify HOW (missing variable / wrong exponent / sign flip /
+             (missing variable / wrong exponent / sign flip /
              ...), with sampled example laws per bucket.
 
   trace      Mine chat_history: reasoning blowup, format failures, hypothesis
-             churn, unverified submissions, plus resource-vs-outcome tables.
+             churn, plus resource-vs-outcome tables.
              Prints an example trajectory for each failure signal.
 
   agents     vanilla vs code_assisted vs planned: per-cell SA, and the
@@ -126,16 +126,19 @@ def cmd_verdicts(args):
 
     print(f"\n{'='*70}\nVerdicts: {args.model}   (n={len(df)})\n{'='*70}")
     print("Deterministic symbolic checking supplies the primary label. Uncheckable rows "
-          "remain unresolved\nunless supplied through --adjudications; RMSLE and the original "
+          "remain unresolved\nunless supplied through --adjudications; RMSLE and the stored "
           "LLM judge are diagnostics only.")
 
     print("\n=== Agreement bucket counts ===")
     print(df["agreement_bucket"].value_counts().to_string())
     n = len(df)
-    print(f"\nraw success (original judge/exact_accuracy): {100*df['raw_success'].mean():.1f}%")
-    resolved = df["verification_resolved"].fillna(False)
+    print(f"\nraw success (stored judge/exact_accuracy): {100*df['raw_success'].mean():.1f}%")
+    # These columns can be object-backed after CSV round-trips.  Normalise to
+    # real boolean masks before negating or indexing; ``~False`` on a Python
+    # bool is -1, which previously produced negative unresolved counts.
+    resolved = df["verification_resolved"].fillna(False).eq(True)  # noqa: E712
     successes = int(df["verified_success"].fillna(False).sum())
-    unresolved = int((~resolved).sum())
+    unresolved = int(resolved.eq(False).sum())  # noqa: E712
     print(f"resolved symbolic labels: {int(resolved.sum())}/{n} ({100*resolved.mean():.1f}% coverage)")
     if resolved.any():
         print(f"success among resolved: {100*df.loc[resolved, 'verified_success'].mean():.1f}%")
@@ -144,23 +147,23 @@ def cmd_verdicts(args):
     comparable = resolved
     flipped = int((df.loc[comparable, "raw_success"].astype(bool) !=
                    df.loc[comparable, "verified_success"].astype(bool)).sum())
-    print(f"{flipped}/{int(comparable.sum())} resolved trials differ from the original judge label.")
+    print(f"{flipped}/{int(comparable.sum())} resolved trials differ from the stored judge label.")
 
     lenient = df[df["agreement_bucket"] == "judge_lenient"]
     strict = df[df["agreement_bucket"] == "judge_strict"]
 
     print("\n=== judge_lenient (judge says equivalent, sympy disagrees) by structural_verdict ===")
     print(lenient["structural_verdict"].value_counts().to_string() if len(lenient) else "(none)")
-    print("  constant_equivalent = right form, wrong constant (arguably still deserves credit)")
-    print("  structurally_different = genuine judge error; not_checkable = needs a human read")
+    print("  constant_equivalent = symbolic checker proved equivalence up to scale")
+    print("  structurally_different = checker found a parameter-dependent mismatch; "
+          "near-zero RMSLE cases still need audit")
+    print("  not_checkable = needs independent adjudication")
     if len(lenient):
-        # check_constant_equivalence's ratio simplify has false positives on trig/log
-        # identities: a numerically-exact fit that it calls structurally_different is
-        # almost always a sympy miss (really a pass), not a judge error.
-        likely_sympy_miss = int((lenient["rmsle"] < 1e-6).sum())
-        likely_judge_err = len(lenient) - likely_sympy_miss
-        print(f"\n  of {len(lenient)} judge_lenient: {likely_sympy_miss} have RMSLE<1e-6 and "
-              f"{likely_judge_err} have RMSLE>=1e-6. These are audit signals only; the "
+        low_rmsle = int(lenient["rmsle_verdict"].fillna(False).eq(True).sum())  # noqa: E712
+        high_rmsle = len(lenient) - low_rmsle
+        print(f"\n  of {len(lenient)} judge_lenient: {low_rmsle} have RMSLE"
+              f"<{args.rmsle_threshold:g} and {high_rmsle} have RMSLE"
+              f">={args.rmsle_threshold:g}. These are audit signals only; the "
               f"deterministic verdict remains the label unless explicitly adjudicated.")
 
     print("\n=== Breakdown by module ===")
@@ -171,8 +174,9 @@ def cmd_verdicts(args):
     concerning = lenient[lenient["structural_verdict"] == "structurally_different"].sort_values(
         "rmsle", ascending=False)
     if len(concerning):
-        print(f"\n=== Top {min(args.top, len(concerning))} concerning judge errors "
-              f"(sorted by RMSLE; ~1e-16 = classifier miss, ~1e-3+ = real) ===")
+        print(f"\n=== Top {min(args.top, len(concerning))} judge/checker disagreements "
+              f"(sorted by RMSLE; below {args.rmsle_threshold:g} is numerical agreement "
+              f"that still needs audit) ===")
         print(concerning[show].head(args.top).to_string(index=False))
     if len(strict):
         print(f"\n=== Top {min(args.top, len(strict))} judge_strict (lowest RMSLE = likely false negative) ===")
@@ -181,20 +185,46 @@ def cmd_verdicts(args):
     print(f"\nPer-trial verified_success labels written to "
           f"{verdicts_csv_path(args.model, args.budget, args.result_dir)} "
           f"(scoreboard.py --verified and the other subcommands read this).")
-    unresolved_rows = df[~df["verification_resolved"].fillna(False)].copy()
+    unresolved_mask = df["verification_resolved"].fillna(False).eq(False)  # noqa: E712
+    unresolved_rows = df[unresolved_mask].copy()
+    review_columns = [
+        "path", "module", "equation_difficulty", "model_system", "law_version",
+        "agent_backend", "trial_id", "submitted_law", "ground_truth_law",
+        "judge_verdict", "rmsle", "rmsle_verdict", "structural_verdict",
+        "agreement_bucket", "verified_success", "verification_source",
+    ]
     if not unresolved_rows.empty:
         review_path = analysis_path(f"unresolved_{args.model}{_tag(args)}.csv")
-        review_rows = unresolved_rows[[
-            "path", "module", "equation_difficulty", "model_system", "law_version",
-            "agent_backend", "trial_id", "submitted_law", "ground_truth_law",
-            "judge_verdict", "rmsle", "structural_verdict",
-        ]].copy()
+        review_rows = unresolved_rows[review_columns].copy()
         review_rows["adjudicated_success"] = ""
         review_rows["adjudicator"] = ""
         review_rows["notes"] = ""
         review_rows.to_csv(review_path, index=False)
         print(f"Unresolved review template written to {review_path}. Fill its label/adjudicator "
               f"columns, then rerun with --adjudications {review_path}.")
+
+    # A checker result and a model verdict can disagree even when both are
+    # individually decisive.  In particular, a symbolic ``different`` result
+    # paired with near-zero RMSLE can be an unrecognised identity or a
+    # finite-domain coincidence.  Export these alongside unresolved cases so
+    # publication scoring cannot silently overlook them.  Already adjudicated
+    # conflicts are excluded to avoid overwriting a completed review file.
+    conflict = df["agreement_bucket"].isin(["judge_lenient", "judge_strict"])
+    already_adjudicated = df["verification_source"].fillna("").str.startswith("adjudication:")
+    unaudited_conflict = conflict & already_adjudicated.eq(False)  # noqa: E712
+    candidate_mask = unresolved_mask | unaudited_conflict
+    candidates = df[candidate_mask].copy()
+    if not candidates.empty:
+        candidate_path = analysis_path(f"adjudication_candidates_{args.model}{_tag(args)}.csv")
+        candidate_rows = candidates[review_columns].copy()
+        candidate_rows["adjudicated_success"] = ""
+        candidate_rows["adjudicator"] = ""
+        candidate_rows["notes"] = ""
+        candidate_rows.to_csv(candidate_path, index=False)
+        n_conflict = int(unaudited_conflict.sum())
+        print(f"Combined adjudication template written to {candidate_path} "
+              f"({len(unresolved_rows)} unresolved + {n_conflict} unaudited disagreement rows). "
+              f"For a complete audit, fill every label and pass this file to --adjudications.")
 
 
 # ===========================================================================
@@ -218,8 +248,9 @@ def cmd_mistakes(args):
     from mismatch_classifier import classify_mismatch
 
     df = verdict_frame(args)
-    fails = df[(df["verification_resolved"].fillna(False)) &
-               (~df["verified_success"].fillna(False))].copy()
+    resolved = df["verification_resolved"].fillna(False).eq(True)  # noqa: E712
+    failed = df["verified_success"].fillna(False).eq(False)  # noqa: E712
+    fails = df[resolved & failed].copy()
     if fails.empty:
         raise SystemExit("No resolved symbolic failures -- nothing to classify.")
 
@@ -247,7 +278,7 @@ def cmd_mistakes(args):
     fails["mistake_detail"] = [cache.get((s, g), ("not_checkable", ""))[1]
                                for s, g in zip(fails["submitted_law"], fails["ground_truth_law"])]
 
-    print(f"\n{'='*70}\nMistake taxonomy: {args.model}   ({len(fails)} genuinely-wrong trials)\n{'='*70}")
+    print(f"\n{'='*70}\nMistake taxonomy: {args.model}   ({len(fails)} resolved failures)\n{'='*70}")
     counts = fails["mistake_type"].value_counts()
     for mt in MISTAKE_ORDER:
         if mt in counts.index:
@@ -323,14 +354,12 @@ def analyse_trace(chat_history):
         tot_count += len(toks)
         nan_count += sum(t.lower() == "nan" for t in toks)
 
-    exp_request_turns = [i for i, resp in enumerate(responses) if "<run_experiment>" in resp]
-    seen, first_turn = {}, {}
-    for i, resp in enumerate(responses):
+    seen = set()
+    for resp in responses:
         for body in _LAW_BODY_RE.findall(resp):
             key = _norm_law(body)
-            if key and key not in seen:
-                seen[key] = i
-                first_turn[key] = i
+            if key:
+                seen.add(key)
 
     final_key = None
     for resp in reversed(responses):
@@ -338,11 +367,6 @@ def analyse_trace(chat_history):
         if bodies:
             final_key = _norm_law(bodies[-1])
             break
-    if final_key is None or final_key not in first_turn:
-        unverified_submit = True
-    else:
-        unverified_submit = not any(t >= first_turn[final_key] for t in exp_request_turns)
-
     return dict(
         assistant_turns=len(assistant),
         format_failures=format_failures,
@@ -353,7 +377,6 @@ def analyse_trace(chat_history):
         nan_fraction=(nan_count / tot_count) if tot_count else 0.0,
         hypothesis_churn=len(seen),
         no_parseable_law=final_key is None,
-        unverified_submit=unverified_submit,
         reasoning_chars=sum(len(r) for r in reasonings),
         max_msg_chars=max((len(c) for c in assistant), default=0),
     )
@@ -362,7 +385,7 @@ def analyse_trace(chat_history):
 TRACE_NUMERIC = ["assistant_turns", "rounds", "num_experiments", "total_tokens", "format_failures",
                  "n_experiment_batches", "n_python_calls", "python_errors", "nan_fraction",
                  "hypothesis_churn", "reasoning_chars", "max_msg_chars"]
-TRACE_BOOL = ["had_format_failure", "no_parseable_law", "unverified_submit"]
+TRACE_BOOL = ["had_format_failure", "no_parseable_law"]
 
 
 def _bin(df, col, bins, labels, tgt="verified_success"):
@@ -382,16 +405,21 @@ def _budget_trace(df):
     print("\n--- budget vs. outcome ---")
     g = d.groupby("verified_success")[["budget_spent", "funds_remaining", "num_billed_requests"]].mean()
     if list(g.index) == [False, True]:
-        g.index = [f"fail(n={int((~d['verified_success']).sum())})",
-                   f"success(n={int(d['verified_success'].sum())})"]
+        # ``verified_success`` can be object-backed after CSV merge.  Applying
+        # bitwise ``~`` to Python bools produces -1/-2 rather than booleans,
+        # yielding nonsense labels such as ``fail(n=-376)``.  Count the two
+        # values explicitly instead.
+        g.index = [f"fail(n={int(d['verified_success'].eq(False).sum())})",  # noqa: E712
+                   f"success(n={int(d['verified_success'].eq(True).sum())})"]  # noqa: E712
     print(g.round(1).to_string())
     sub = d[["budget_spent", "verified_success"]].dropna()
     if len(sub) >= 3 and sub["budget_spent"].std() > 0:
         print(f"  corr(budget_spent, verified_success) = "
               f"{sub['budget_spent'].corr(sub['verified_success'].astype(float)):+.3f}")
-    ov = d[d["budget_overspent"].fillna(False)]
+    overspent = d["budget_overspent"].fillna(False).eq(True)  # noqa: E712
+    ov = d[overspent]
     if len(ov):
-        rest = d[~d["budget_overspent"].fillna(False)]
+        rest = d[overspent.eq(False)]  # noqa: E712
         print(f"  overspent the grant: {len(ov)}/{len(d)} ({100*len(ov)/len(d):.1f}%), "
               f"verified_success {100*ov['verified_success'].mean():.1f}% "
               f"(others {100*rest['verified_success'].mean():.1f}%)")
@@ -411,11 +439,12 @@ def _trace_report(df, label, example_sink):
     print("\n--- Mean trace feature by outcome ---")
     g = df.groupby("verified_success")[TRACE_NUMERIC].mean().T
     if list(g.columns) == [False, True]:
-        g.columns = [f"fail(n={int((~df['verified_success']).sum())})",
-                     f"success(n={int(df['verified_success'].sum())})"]
+        g.columns = [f"fail(n={int(df['verified_success'].eq(False).sum())})",  # noqa: E712
+                     f"success(n={int(df['verified_success'].eq(True).sum())})"]  # noqa: E712
     print(g.round(2).to_string())
 
     print("\n--- Point-biserial correlation with verified_success ---")
+    print("  descriptive only: difficulty and failure can themselves increase resource use")
     for feat in TRACE_NUMERIC:
         sub = df[[feat, "verified_success"]].dropna()
         if len(sub) < 3 or sub[feat].std() == 0:
@@ -426,7 +455,8 @@ def _trace_report(df, label, example_sink):
     print("\n--- Binary behaviours: prevalence and success rate ---")
     rows = []
     for feat in TRACE_BOOL:
-        p, a = df[df[feat].fillna(False)], df[~df[feat].fillna(False)]
+        present = df[feat].fillna(False).eq(True)  # noqa: E712
+        p, a = df[present], df[present.eq(False)]  # noqa: E712
         rows.append(dict(behaviour=feat, pct=round(100 * len(p) / n, 1),
                          success_present=round(100 * p["verified_success"].mean(), 1) if len(p) else np.nan,
                          success_absent=round(100 * a["verified_success"].mean(), 1) if len(a) else np.nan))
@@ -467,26 +497,26 @@ def _trace_report(df, label, example_sink):
               f"verified_success {100*prem['verified_success'].mean():.1f}% "
               f"(everyone else {100*df[~df.index.isin(prem.index)]['verified_success'].mean():.1f}%)")
 
-    nl = df[df["no_parseable_law"].fillna(False)]
+    no_law = df["no_parseable_law"].fillna(False).eq(True)  # noqa: E712
+    nl = df[no_law]
     if len(nl):
         print(f"\nno parseable <final_law>: {len(nl)}/{n}, success {100*nl['verified_success'].mean():.1f}%")
         print(nl.groupby(["module", "agent_backend"], observed=True).size().to_string())
-    ff = df[df["had_format_failure"].fillna(False)]
+    format_failure = df["had_format_failure"].fillna(False).eq(True)  # noqa: E712
+    ff = df[format_failure]
     if len(ff):
         print(f"\n>=1 format failure: {len(ff)}/{n} ({100*len(ff)/n:.1f}%), "
               f"{int(df['format_failures'].sum())} wasted turns, "
               f"success {100*ff['verified_success'].mean():.1f}% "
-              f"(vs {100*df[~df['had_format_failure'].fillna(False)]['verified_success'].mean():.1f}%)")
+              f"(vs {100*df[format_failure.eq(False)]['verified_success'].mean():.1f}%)")  # noqa: E712
 
     # stash an example failing trajectory for each signal (printed once, at top level)
     for sig, mask in [
         ("reasoning blowup (longest msg, a resolved failure)",
-         (~df["verified_success"].fillna(True)) & df["max_msg_chars"].notna()),
+         df["verified_success"].eq(False) & df["max_msg_chars"].notna()),  # noqa: E712
         ("format failure (a resolved failure)",
-         (~df["verified_success"].fillna(True)) & df["had_format_failure"].fillna(False)),
-        ("unverified submit (a resolved failure)",
-         (~df["verified_success"].fillna(True)) & df["unverified_submit"].fillna(False)),
-        ("no parseable final_law", df["no_parseable_law"].fillna(False)),
+         df["verified_success"].eq(False) & format_failure),  # noqa: E712
+        ("no parseable final_law", no_law),
     ]:
         cand = df[mask]
         if len(cand) and sig not in example_sink:

@@ -11,16 +11,16 @@ writes updated results alongside the originals.
 
 Usage:
     # Use an independently hosted local judge that fits the project's hardware.
-    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b
+    python rejudge.py --model muse-glimmer-30b --judge gemma4-31b
 
     # Re-judge only one module
-    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --module m0_gravity
+    python rejudge.py --model muse-glimmer-30b --judge gemma4-31b --module m0_gravity
 
     # Dry run: show what would be re-judged
-    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --dry-run
+    python rejudge.py --model muse-glimmer-30b --judge gemma4-31b --dry-run
 
     # Overwrite original files instead of creating new ones
-    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --in-place
+    python rejudge.py --model muse-glimmer-30b --judge gemma4-31b --in-place
 """
 
 import argparse
@@ -112,11 +112,17 @@ def main():
                         help="Overwrite original trial JSONs. Default: write to a parallel directory.")
     parser.add_argument("--output-suffix", default=None,
                         help="Suffix for output dir (default: judge model name)")
+    parser.add_argument("--judge-max-tokens", type=int, default=2048,
+                        help="maximum completion tokens for each judge call (default: 2048)")
     args = parser.parse_args()
     args.budget = args.budget or bool(args.budget_config)
     if args.judge == args.model and not args.allow_self_judge:
         raise SystemExit("Refusing self-judging. Choose an independent local judge, or pass "
                          "--allow-self-judge for a diagnostic-only run.")
+    if args.judge_max_tokens <= 0:
+        raise SystemExit("--judge-max-tokens must be positive")
+    # Module imports happen lazily below, so the API helper will see this cap.
+    os.environ["LLM_MAX_TOKENS"] = str(args.judge_max_tokens)
 
     if args.base_dir is None:
         if args.budget:
@@ -137,7 +143,8 @@ def main():
         return
 
     suffix = args.output_suffix or args.judge
-    output_base = Path(args.base_dir) / f"{args.model}_judged_by_{suffix}"
+    output_model_name = f"{args.model}_judged_by_{suffix}"
+    output_base = Path(args.base_dir) / output_model_name
 
     # Find all trial JSON files, split into ones that need re-judging vs. failed
     # trials that should still count toward the aggregate but don't need an API
@@ -210,6 +217,7 @@ def main():
             new_eval = rejudge_trial(trial_data, args.judge)
             if new_eval is None:
                 print("SKIP (missing data)")
+                fail += 1
                 continue
 
             new_acc = new_eval.get("exact_accuracy", 0.0)
@@ -219,6 +227,13 @@ def main():
             trial_data["evaluation"] = new_eval
             trial_data["original_judge"] = original_judge
             trial_data["LLM judge"] = args.judge
+            if not args.in_place:
+                # The directory name is the analysis run identity. Preserve
+                # the evaluated checkpoint separately so scoreboard can load
+                # the parallel tree by its directory/model name without
+                # filtering every row back out as the original model.
+                trial_data["evaluated_model"] = trial_data.get("model_name", args.model)
+                trial_data["model_name"] = output_model_name
 
             # Write output
             if args.in_place:
@@ -262,6 +277,8 @@ def main():
             continue
 
         if not args.in_place:
+            trial_data["evaluated_model"] = trial_data.get("model_name", args.model)
+            trial_data["model_name"] = output_model_name
             out_path = output_base / rel
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w") as f:
@@ -292,6 +309,9 @@ def main():
         existing_agg["aggregate"]["all_trials"].update(agg)
         existing_agg["config"] = existing_agg.get("config", {})
         existing_agg["config"]["LLM judge"] = args.judge
+        if not args.in_place:
+            existing_agg["config"]["evaluated_model"] = args.model
+            existing_agg["config"]["model_name"] = output_model_name
 
         with open(agg_path, "w") as f:
             json.dump(existing_agg, f, indent=2)
@@ -299,6 +319,8 @@ def main():
     print(f"\nDone: {success} succeeded, {fail} failed, {changed} changed verdict")
     if not args.in_place:
         print(f"Re-judged results written to: {output_base}/")
+    if fail:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

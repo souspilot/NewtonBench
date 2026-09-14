@@ -29,13 +29,16 @@ keys = {
 # Per-request read timeout (seconds). The openai SDK's own default is 600s with
 # max_retries=2, which can silently burn ~30 min on a hung request before raising.
 # That's more of a risk for a local vLLM-served reasoning model (e.g. QwQ-32B) than
-# a hosted API: no max_tokens cap is set on these requests, so a long chain-of-
-# thought can run long, and concurrent --parallel workers hitting one local server
-# queue behind each other before generation even starts. Override via
-# LLM_REQUEST_TIMEOUT_SECONDS if needed; max_retries is set to 1 (not the SDK
-# default of 2) so a genuinely stuck request fails after ~2x this timeout instead
-# of ~3x.
+# a hosted API: a long chain-of-thought can run long, and concurrent workers
+# hitting one local server can queue behind each other before generation starts.
+# Override the timeout and optional completion cap through the environment;
+# max_retries is set to 1 so a genuinely stuck request fails after ~2x this
+# timeout instead of ~3x.
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "1800"))
+_max_tokens_env = os.getenv("LLM_MAX_TOKENS")
+LLM_MAX_TOKENS = int(_max_tokens_env) if _max_tokens_env else None
+if LLM_MAX_TOKENS is not None and LLM_MAX_TOKENS <= 0:
+    raise ValueError("LLM_MAX_TOKENS must be a positive integer")
 
 # development: economic use for development stage / final evaluation
 # formal: ONLY evaluated in final stage
@@ -194,6 +197,8 @@ def call_llm_api(messages, model_name, keys=keys, temperature=0.4, trial_info=No
                 "messages": messages,
                 "temperature": temperature,
             }
+            if LLM_MAX_TOKENS is not None:
+                params["max_tokens"] = LLM_MAX_TOKENS
             if model_name == "dsv3":
                 params["reasoning"] = {"enabled": True} 
 
@@ -213,6 +218,10 @@ def call_llm_api(messages, model_name, keys=keys, temperature=0.4, trial_info=No
                 data = response.json()
                 # Check if response has expected structure
                 if 'choices' in data and len(data['choices']) > 0:
+                    if data['choices'][0].get('finish_reason') == 'length':
+                        raise RuntimeError(
+                            f"Model {model_name} exhausted LLM_MAX_TOKENS before a complete response"
+                        )
                     content = data['choices'][0]['message']['content']
                     reasoning_content = data['choices'][0]['message'].get('reasoning', None)
                     if reasoning_content is None:
@@ -273,11 +282,18 @@ def call_llm_api(messages, model_name, keys=keys, temperature=0.4, trial_info=No
             model_with_fix_temp = ["o4mini", "gpt5", "gpt5mini"] 
             if model_name in model_with_fix_temp:
                 temperature = 1.0
-            completion = client.chat.completions.create(
-                model=full_model_name,
-                messages=messages,
-                temperature=temperature
-            )
+            params = {
+                "model": full_model_name,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if LLM_MAX_TOKENS is not None:
+                params["max_tokens"] = LLM_MAX_TOKENS
+            completion = client.chat.completions.create(**params)
+            if completion.choices[0].finish_reason == "length":
+                raise RuntimeError(
+                    f"Model {model_name} exhausted LLM_MAX_TOKENS before a complete response"
+                )
             content = completion.choices[0].message.content
             reasoning_content = getattr(completion.choices[0].message, 'reasoning_content', None)
             if reasoning_content is None:
