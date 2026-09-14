@@ -34,6 +34,24 @@ python analysis/diagnostics.py trace --model qwen38-27b --budget-config configs/
 The same selection can be exported once as `NEWTONBENCH_BUDGET_CONFIG`; child
 runner processes inherit it automatically.
 
+### Filling several partial runs together
+
+`run_master.py` can put multiple budget configs into one shared worker queue.
+Completed configurations exit without running anything, while partial ones are
+topped up to `--trials_per_law` (4 by default). Quote the glob so it is expanded
+by the runner:
+
+```bash
+python run_master.py --model_name qwen38-27b --parallel 12 \
+  --budget-config-glob 'configs/budget/budget_[0-9]*.json'
+```
+
+You can instead repeat `--budget-config`. Every selected JSON must have a unique
+`results_dir`; the master rejects duplicates to prevent concurrent writers from
+touching the same trial tree. Jobs are interleaved by budget config, so one local
+vLLM server receives work from all partial runs rather than finishing one budget
+before moving to the next.
+
 Budgeted results are written to a **separate** directory tree (default
 `budget_evaluation_results/`, set by `results_dir` below) so they never mix with
 the standard `evaluation_results/`. The analysis scripts take a matching

@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+import glob
 import json
 import os
 import subprocess
@@ -77,37 +78,77 @@ def build_commands(
     trials_per_law: int = 0,
     budget: bool = False,
     budget_config: str = "",
+    budget_configs: Sequence[str] = (),
 ) -> List[List[str]]:
     run_all = repo_root / "run_all_evaluations.py"
     if not run_all.exists():
         raise FileNotFoundError(f"Missing script: {run_all}")
     commands: List[List[str]] = []
+    selected_configs = list(budget_configs) or ([budget_config] if budget_config else [""])
     for model in models:
         for module in modules:
             for backend in ["vanilla_agent", "code_assisted_agent"]:
-                cmd = [
-                    "python",
-                    "run_all_evaluations.py",
-                    "--module",
-                    module,
-                    "--model_name",
-                    model,
-                    "--agent_backend",
-                    backend,
-                    "--no_prompt",
-                ]
-                if full:
-                    cmd.append("--full")
-                elif subset_file:
-                    cmd.extend(["--subset_file", subset_file])
-                if trials_per_law:
-                    cmd.extend(["--trials_per_law", str(trials_per_law)])
-                if budget:
-                    cmd.append("--budget")
-                if budget_config:
-                    cmd.extend(["--budget-config", budget_config])
-                commands.append(cmd)
+                # Put configs in the innermost loop so the shared worker queue
+                # reaches every run early instead of draining one budget first.
+                for selected_config in selected_configs:
+                    cmd = [
+                        "python",
+                        "run_all_evaluations.py",
+                        "--module",
+                        module,
+                        "--model_name",
+                        model,
+                        "--agent_backend",
+                        backend,
+                        "--no_prompt",
+                    ]
+                    if full:
+                        cmd.append("--full")
+                    elif subset_file:
+                        cmd.extend(["--subset_file", subset_file])
+                    if trials_per_law:
+                        cmd.extend(["--trials_per_law", str(trials_per_law)])
+                    if budget or selected_config:
+                        cmd.append("--budget")
+                    if selected_config:
+                        cmd.extend(["--budget-config", selected_config])
+                    commands.append(cmd)
     return commands
+
+
+def resolve_budget_configs(explicit: Sequence[str], patterns: Sequence[str]) -> List[str]:
+    """Expand, de-duplicate, and validate the budget run configs selected by the CLI."""
+    paths = list(explicit)
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            raise ValueError(f"--budget-config-glob matched no files: {pattern}")
+        paths.extend(matches)
+
+    unique: List[str] = []
+    seen = set()
+    results_dirs = {}
+    for raw_path in paths:
+        path = os.path.normpath(raw_path)
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            raise ValueError(f"Could not read budget config '{path}': {e}") from e
+        results_dir = config.get("results_dir")
+        if not isinstance(results_dir, str) or not results_dir.strip():
+            raise ValueError(f"Budget config '{path}' must define a non-empty results_dir")
+        if results_dir in results_dirs:
+            raise ValueError(
+                f"Budget configs '{results_dirs[results_dir]}' and '{path}' both write to "
+                f"'{results_dir}'. Give every concurrent run a distinct results_dir."
+            )
+        results_dirs[results_dir] = path
+        unique.append(path)
+    return unique
 
 
 def print_commands(commands: Sequence[Sequence[str]], repo_root: Path) -> None:
@@ -260,8 +301,12 @@ def main():
              "run_all_evaluations.py). See configs/budget/README.md.",
     )
     parser.add_argument(
-        "--budget-config", default="",
-        help="Budget run JSON to use. Supplying it enables budget mode and uses its results_dir.",
+        "--budget-config", action="append", default=[],
+        help="Budget run JSON to use. Repeat to fill several runs through one worker pool.",
+    )
+    parser.add_argument(
+        "--budget-config-glob", action="append", default=[],
+        help="Glob selecting budget run JSONs (quote it so Python expands it). Repeatable.",
     )
 
     args = parser.parse_args()
@@ -269,6 +314,7 @@ def main():
     repo_root = Path(__file__).resolve().parent
     modules = discover_modules(repo_root / "modules")
     models = resolve_models(repo_root, args.model_name, Path(args.models_file))
+    budget_configs = resolve_budget_configs(args.budget_config, args.budget_config_glob)
 
     if not args.full:
         subset_file_for_modules = args.subset_file or DEFAULT_SUBSET_FILE
@@ -281,7 +327,7 @@ def main():
     commands = build_commands(
         repo_root, modules, models,
         full=args.full, subset_file=args.subset_file, trials_per_law=args.trials_per_law,
-        budget=args.budget or bool(args.budget_config), budget_config=args.budget_config,
+        budget=args.budget or bool(budget_configs), budget_configs=budget_configs,
     )
 
     # Always show the commands before running
