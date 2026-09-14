@@ -10,20 +10,17 @@ the symbolic equivalence check with the specified judge model, and
 writes updated results alongside the originals.
 
 Usage:
-    # Re-judge all qwq-32b results with the paper's judge (gpt41) -- this is the
-    # judge run_experiments.py used before your self-judge hack, and is what you
-    # need for numbers to be comparable to Table 2 / Appendix B.1. Pass a
-    # different --judge only if you deliberately want a non-paper comparison.
-    python rejudge.py --model qwq-32b --judge gpt41
+    # Use an independently hosted local judge that fits the project's hardware.
+    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b
 
     # Re-judge only one module
-    python rejudge.py --model qwq-32b --judge gpt41 --module m0_gravity
+    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --module m0_gravity
 
     # Dry run: show what would be re-judged
-    python rejudge.py --model qwq-32b --judge gpt41 --dry-run
+    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --dry-run
 
     # Overwrite original files instead of creating new ones
-    python rejudge.py --model qwq-32b --judge gpt41 --in-place
+    python rejudge.py --model muse-glimmer-30b --judge qwen38-27b --in-place
 """
 
 import argparse
@@ -35,9 +32,6 @@ import glob
 import numpy as np
 import traceback
 from pathlib import Path
-
-
-PAPER_JUDGE_MODEL = "gpt41"  # judge_model_name used by upstream run_experiments.py / the paper's Table 2 & Appendix B.1
 
 
 def load_module(module_name: str):
@@ -99,10 +93,12 @@ def rejudge_aggregated(trial_results: list) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Re-judge NewtonBench results")
     parser.add_argument("--model", required=True, help="Model whose results to re-judge")
-    parser.add_argument("--judge", default=PAPER_JUDGE_MODEL,
-                        help=f"LLM model to use as judge (default: '{PAPER_JUDGE_MODEL}', matching what "
-                             f"upstream run_experiments.py / the paper's Table 2 and Appendix B.1 used -- "
-                             f"pass a different value only if you deliberately want a non-paper-comparable judge).")
+    parser.add_argument("--judge", required=True,
+                        help="Independent locally hosted judge model. It must fit on at most two "
+                             "80GB A100 GPUs under the project's evaluation policy.")
+    parser.add_argument("--allow-self-judge", action="store_true",
+                        help="Allow judge == evaluated model for diagnostics only; never use this "
+                             "output as the publication label.")
     parser.add_argument("--base-dir", default=None,
                         help="default: evaluation_results, or the budgeted tree when --budget is set")
     parser.add_argument("--budget", action="store_true",
@@ -118,6 +114,9 @@ def main():
                         help="Suffix for output dir (default: judge model name)")
     args = parser.parse_args()
     args.budget = args.budget or bool(args.budget_config)
+    if args.judge == args.model and not args.allow_self_judge:
+        raise SystemExit("Refusing self-judging. Choose an independent local judge, or pass "
+                         "--allow-self-judge for a diagnostic-only run.")
 
     if args.base_dir is None:
         if args.budget:
@@ -161,14 +160,11 @@ def main():
         else:
             trial_files.append(trial_path)
 
-    print(f"Found {len(trial_files)} trial files to re-judge "
-          f"(+ {len(fail_files)} already-failed trials carried into the aggregate unchanged, not re-judged)")
+    print(f"Found {len(trial_files)} completed trial files to re-judge "
+          f"(+ {len(fail_files)} operational failure files copied separately, not scored)")
     print(f"  Model: {args.model}")
     print(f"  Judge: {args.judge}")
-    if args.judge != PAPER_JUDGE_MODEL:
-        print(f"  WARNING: judge '{args.judge}' != paper's judge '{PAPER_JUDGE_MODEL}' -- results won't be "
-              f"directly comparable to Table 2 / Appendix B.1 (you'll have swapped a self-judging bias for "
-              f"a different judge-model mismatch). Use --judge {PAPER_JUDGE_MODEL} for paper-comparable numbers.")
+    print("  Policy: judge must be independently hosted locally and fit on <=2x A100-80GB")
     if args.module:
         print(f"  Module filter: {args.module}")
     if args.agent:
@@ -252,10 +248,8 @@ def main():
             traceback.print_exc()
             fail += 1
 
-    # Carry already-failed trials into the aggregate unchanged -- they still count
-    # toward num_total_trials / average_exact_accuracy (as 0.0), matching how
-    # run_experiments.py's original aggregation includes them, but they were never
-    # re-judged so no judge/API call was spent on them.
+    # Preserve failure records in parallel output for operational audits, but do
+    # not mix runner/API failures into scientific accuracy.
     for trial_path in fail_files:
         rel = trial_path.relative_to(model_dir)
         config_dir = trial_path.parent.parent
@@ -273,12 +267,8 @@ def main():
             with open(out_path, "w") as f:
                 json.dump(trial_data, f, indent=2)
 
-        config_key = str(config_dir)
-        config_trials.setdefault(config_key, []).append(trial_data)
-
     if fail_files:
-        print(f"Carried over {len(fail_files)} already-failed trial(s) into the aggregate unchanged "
-              f"(no judge call spent on them).")
+        print(f"Copied {len(fail_files)} operational failure record(s) without scoring them.")
 
     # Write updated aggregated_results.json for each config
     for config_key, trials_list in config_trials.items():

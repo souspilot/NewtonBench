@@ -19,6 +19,8 @@ here so neither entry point imports the other.
 `compute_verdicts` imports structural_equivalence lazily, so importing this
 module does NOT pull in sympy: scoreboard.py stays sympy-free.
 """
+import ast
+import hashlib
 import json
 import os
 import re
@@ -85,6 +87,16 @@ AGGREGATED_SUMMARY_CSV = str(ANALYSIS_DIR / "aggregated_trial_summary.csv")
 BUDGET_COLS = ["budget_spent", "funds_remaining", "budget_overdraft", "budget_overspent",
                "num_billed_requests", "starting_funds"]
 
+# The runner's sampling protocol keeps the latest four completed trajectories
+# per task configuration. Infrastructure failures are attempts, not replacement
+# scientific trials, and are reported separately.
+TARGET_TRIALS_PER_CONFIG = 4
+TRIAL_IDENTITY_COLS = [
+    "module", "noise_level", "equation_difficulty", "model_system",
+    "law_version", "agent_backend", "trial_id",
+]
+TRIAL_CONFIG_COLS = [c for c in TRIAL_IDENTITY_COLS if c != "trial_id"]
+
 
 def analysis_path(name: str) -> str:
     """A path inside analysis/ (verdicts_<model>.csv, trace CSVs, ...), cwd-independent."""
@@ -114,10 +126,24 @@ def resolve_result_dir(result_dir: Optional[str], budget: bool,
     return budget_result_dir(budget_config) if (budget or budget_config) else "evaluation_results"
 
 
-def results_by_trial_csv(budget: bool) -> str:
-    """Budgeted runs get their own CSV so their rows never collide with standard
-    runs on the (model, module, ..., trial_id) upsert key."""
-    return RESULTS_BY_TRIAL_BUDGET_CSV if budget else RESULTS_BY_TRIAL_CSV
+def result_run_suffix(budget: bool, result_dir: Optional[str] = None) -> str:
+    """Filesystem-safe analysis suffix identifying the exact result tree."""
+    if not budget:
+        return ""
+    if not result_dir:
+        return "_budget"
+    name = Path(result_dir).resolve().name
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_.-") or "budget"
+    return f"_{slug}"
+
+
+def results_by_trial_csv(budget: bool, result_dir: Optional[str] = None) -> str:
+    """Return a run-specific CSV path so different budgets cannot collide."""
+    if not budget:
+        return RESULTS_BY_TRIAL_CSV
+    if not result_dir:
+        return RESULTS_BY_TRIAL_BUDGET_CSV
+    return analysis_path(f"results_by_trial{result_run_suffix(True, result_dir)}.csv")
 
 
 def _budget_from_trial(data: dict) -> dict:
@@ -144,17 +170,23 @@ def _path_version(trial_path: Path) -> int:
     return int(m.group(1)) if m else 0
 
 
-def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.DataFrame:
-    """One row per real trial JSON under evaluation_results/<model>/.
+def load_trials(result_dir: str, model: str, include_fails: bool = False,
+                max_trials_per_config: Optional[int] = TARGET_TRIALS_PER_CONFIG) -> pd.DataFrame:
+    """Load a reproducible set of trial attempts from ``result_dir/model``.
 
-    include_fails=True keeps *_fail.json (round-budget-exhausted trials, stub
-    nan submission) with is_fail=True and exact_accuracy defaulted to 0.0 -- a
-    trial that burned its budget and failed IS the data point a "did hitting
-    the round limit correlate with failure" question needs.
+    Completed ``trialN.json`` files are scientific trials. A completed trial
+    with missing/malformed evaluation output is retained and assigned accuracy
+    0; missing RMSLE never removes it from the accuracy denominator.
 
-    De-dupes to one row per (module, difficulty, system, law_version,
-    agent_backend, trial_id), keeping the highest _vN config directory, so
-    stale re-run directories don't get counted as independent trials.
+    ``trialN_fail.json`` files are runner/infrastructure failures after retries.
+    They are excluded from scientific accuracy by default. Set
+    ``include_fails=True`` for operational audits; a completed file always wins
+    over a fail file with the same logical identity.
+
+    Re-run directories are de-duplicated by logical identity. The latest
+    ``_vN`` completed record is kept, then only the highest trial IDs up to
+    ``max_trials_per_config`` are retained per task configuration. Pass None
+    to disable that final cap (useful for failure-rate audits).
     """
     model_dir = Path(result_dir) / model
     if not model_dir.is_dir():
@@ -167,23 +199,37 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
             if is_fail and not include_fails:
                 continue
             try:
-                with open(trial_path) as f:
-                    data = json.load(f)
+                raw_bytes = trial_path.read_bytes()
+                data = json.loads(raw_bytes)
             except Exception as e:  # noqa: BLE001
                 print(f"Skipping unreadable {trial_path}: {e}")
                 continue
 
             ev = data.get("evaluation", {}) or {}
-            acc = ev.get("exact_accuracy")
-            if acc is None and is_fail:
+            raw_acc = ev.get("exact_accuracy")
+            try:
+                acc = float(raw_acc)
+                if not np.isfinite(acc) or acc not in (0.0, 1.0):
+                    raise ValueError
+            except (TypeError, ValueError):
+                # A completed but malformed submission is a scientific failure,
+                # not missing data. This is the key denominator invariant.
                 acc = 0.0
+            m = re.search(r"trial(\d+)", trial_path.name)
+            trial_id = data.get("trial_id")
+            if trial_id is None and m:
+                trial_id = int(m.group(1))
             rows.append(dict(
                 path=str(trial_path),
+                file_sha256=hashlib.sha256(raw_bytes).hexdigest(),
                 path_version=_path_version(trial_path),
+                path_mtime=trial_path.stat().st_mtime,
                 is_fail=is_fail,
                 status=data.get("status"),
-                trial_id=data.get("trial_id"),
+                trial_id=trial_id,
                 module=data.get("module_name"),
+                model_name=data.get("model_name", model),
+                noise_level=data.get("noise_level"),
                 equation_difficulty=data.get("equation_difficulty"),
                 model_system=data.get("model_system"),
                 law_version=data.get("law_version"),
@@ -192,6 +238,7 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
                 exact_accuracy=acc,
                 symbolic_equivalent=ev.get("symbolic_equivalent"),
                 symbolic_msg=ev.get("symbolic_msg"),
+                evaluation_error=ev.get("error"),
                 submitted_law=data.get("submitted_law"),
                 ground_truth_law=ev.get("ground_truth_law"),
                 rounds=data.get("rounds"),
@@ -202,19 +249,44 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False) -> pd.
     if not rows:
         raise SystemExit(f"No trial files found under {model_dir}")
     df = pd.DataFrame(rows)
+    df["trial_id"] = pd.to_numeric(df["trial_id"], errors="coerce")
     df["rmsle"] = df["rmsle"].replace([np.inf, -np.inf], np.nan)
 
-    identity_cols = ["module", "equation_difficulty", "model_system", "law_version",
-                     "agent_backend", "trial_id"]
+    # Prefer a completed trajectory to a fail stub for the same logical trial,
+    # even if stale directories contain both. Within that class, latest _vN
+    # and then latest mtime win deterministically.
+    df["_completed_priority"] = (~df["is_fail"]).astype(int)
     before = len(df)
-    df = (df.sort_values("path_version")
-            .drop_duplicates(subset=identity_cols, keep="last")
+    df = (df.sort_values(["_completed_priority", "path_version", "path_mtime", "path"])
+            .drop_duplicates(subset=TRIAL_IDENTITY_COLS, keep="last")
             .reset_index(drop=True))
     dropped = before - len(df)
     if dropped:
         print(f"Dropped {dropped} stale duplicate trial(s) from older re-run directories "
-              f"(kept the highest _vN version per logical config).")
-    return df
+              f"(preferred completed records, then the highest _vN version).")
+
+    if not include_fails:
+        df = df[~df["is_fail"]].copy()
+
+    if max_trials_per_config is not None:
+        if max_trials_per_config <= 0:
+            raise ValueError("max_trials_per_config must be positive or None")
+        # Trial IDs increase on every resumed run, so the highest IDs are the
+        # same latest completed trajectories the runner retains.
+        df = (df.sort_values("trial_id", ascending=False, na_position="last")
+                .groupby(TRIAL_CONFIG_COLS, dropna=False, group_keys=False)
+                .head(max_trials_per_config))
+
+    return (df.drop(columns=["_completed_priority"])
+              .sort_values(TRIAL_CONFIG_COLS + ["trial_id"], na_position="last")
+              .reset_index(drop=True))
+
+
+def load_trial_failures(result_dir: str, model: str) -> pd.DataFrame:
+    """Return de-duplicated runner failures for operational reporting only."""
+    attempts = load_trials(result_dir, model, include_fails=True,
+                           max_trials_per_config=None)
+    return attempts[attempts["is_fail"]].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -301,14 +373,84 @@ def clean_rmsle_outliers(df: pd.DataFrame) -> pd.DataFrame:
 # (lazy sympy import keeps scoreboard.py sympy-free)
 # ---------------------------------------------------------------------------
 
+def _module_parameter_names(module_name: str) -> Optional[List[str]]:
+    """Expected positional parameters from a benchmark module's public signature."""
+    try:
+        # Read prompts.py rather than importing the package. Importing a physics
+        # module pulls in API clients that a standalone scoring machine should
+        # not need merely to recover the public function signature.
+        prompts_path = REPO_ROOT / "modules" / module_name / "prompts.py"
+        tree = ast.parse(prompts_path.read_text(encoding="utf-8"))
+        signature = None
+        for stmt in tree.body:
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                if any(isinstance(t, ast.Name) and t.id == "FUNCTION_SIGNATURE" for t in targets):
+                    value = stmt.value
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        signature = value.value
+                        break
+        if signature is None:
+            return None
+        node = ast.parse(signature + "\n    pass").body[0]
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        return [a.arg for a in node.args.args]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_adjudications(path: Optional[str]) -> Optional[pd.DataFrame]:
+    """Load explicit human/independent-local-judge labels keyed by trial path.
+
+    Required columns are ``path`` and ``adjudicated_success`` (0/1 or
+    true/false). Optional ``adjudicator`` and ``notes`` columns are preserved.
+    Duplicate paths or invalid labels fail loudly.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"--adjudications not found: {path}")
+    adj = pd.read_csv(p)
+    required = {"path", "adjudicated_success"}
+    missing = required - set(adj.columns)
+    if missing:
+        raise SystemExit(f"{path} is missing required columns: {sorted(missing)}")
+    if adj["path"].duplicated().any():
+        dupes = adj.loc[adj["path"].duplicated(keep=False), "path"].tolist()
+        raise SystemExit(f"{path} has duplicate path labels: {dupes[:5]}")
+
+    def parse_label(value):
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"true", "pass", "yes"}:
+            return True
+        if text in {"false", "fail", "no"}:
+            return False
+        raise ValueError(f"invalid adjudicated_success label: {value!r}")
+
+    try:
+        adj["adjudicated_success"] = adj["adjudicated_success"].map(parse_label)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid adjudication file {path}: {exc}") from exc
+    if "adjudicator" not in adj.columns:
+        adj["adjudicator"] = "unspecified"
+    return adj
+
+
 def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
-                     sympy_timeout: float = DEFAULT_SYMPY_TIMEOUT) -> pd.DataFrame:
+                     sympy_timeout: float = DEFAULT_SYMPY_TIMEOUT,
+                     adjudications: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Add judge_verdict / rmsle_verdict / structural_verdict / agreement_bucket.
 
-    agreement_bucket trusts the deterministic sympy structural check whenever
-    it reached a verdict; the RMSLE threshold only decides not_checkable rows.
-    Buckets: consistent_pass, consistent_fail, judge_lenient (judge says
-    equivalent, sympy disagrees), judge_strict (judge says wrong, fit is exact).
+    The deterministic structural result is the primary label whenever it can
+    decide. ``not_checkable`` remains unresolved: RMSLE and the original judge
+    are diagnostics, never silent substitutes for symbolic equivalence. An
+    explicit adjudications table may resolve any row and records its source.
 
     The structural check is run once per UNIQUE (submitted_law, ground_truth_law)
     pair (trials re-run the same config, so pairs repeat a lot) and each call is
@@ -316,27 +458,33 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
     """
     from structural_equivalence import check_constant_equivalence  # lazy: pulls sympy
 
-    df = df.copy()
+    df = df.copy().reset_index(drop=True)
     df["judge_verdict"] = df["symbolic_equivalent"].fillna(False).astype(bool)
-    df["rmsle_verdict"] = df["rmsle"] < rmsle_threshold
+    df["rmsle_verdict"] = pd.to_numeric(df["rmsle"], errors="coerce") < rmsle_threshold
 
     pairs = {}
-    uniq = df[["submitted_law", "ground_truth_law"]].drop_duplicates()
+    uniq = df[["module", "submitted_law", "ground_truth_law"]].drop_duplicates()
     n_timeout = 0
-    for sub, gt in uniq.itertuples(index=False):
+    param_cache = {}
+    for module, sub, gt in uniq.itertuples(index=False):
+        key = (module, sub, gt)
         if not isinstance(sub, str) or not isinstance(gt, str):
-            pairs[(sub, gt)] = "not_checkable"
+            pairs[key] = "not_checkable"
             continue
+        if module not in param_cache:
+            param_cache[module] = _module_parameter_names(module)
         try:
             with time_limit(sympy_timeout):
-                pairs[(sub, gt)] = check_constant_equivalence(sub, gt)
+                pairs[key] = check_constant_equivalence(
+                    sub, gt, expected_param_names=param_cache[module])
         except Exception:  # noqa: BLE001  (TimeoutError included)
-            pairs[(sub, gt)] = "not_checkable"
+            pairs[key] = "not_checkable"
             n_timeout += 1
     if n_timeout:
         print(f"  ({n_timeout} law pair(s) hit the {sympy_timeout}s sympy timeout -> not_checkable)")
-    df["structural_verdict"] = [pairs.get((s, g), "not_checkable")
-                                for s, g in zip(df["submitted_law"], df["ground_truth_law"])]
+    df["structural_verdict"] = [pairs.get((m, s, g), "not_checkable")
+                                for m, s, g in zip(df["module"], df["submitted_law"],
+                                                   df["ground_truth_law"])]
 
     def bucket(row):
         j = row["judge_verdict"]
@@ -345,18 +493,31 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
             return "consistent_pass" if j else "judge_strict"
         if sv == "structurally_different":
             return "judge_lenient" if j else "consistent_fail"
-        r = row["rmsle_verdict"]
-        if j and r:
-            return "consistent_pass"
-        if not j and not r:
-            return "consistent_fail"
-        if j and not r:
-            return "judge_lenient"
-        return "judge_strict"
+        return "unresolved"
 
     df["agreement_bucket"] = df.apply(bucket, axis=1)
     df["raw_success"] = df["exact_accuracy"].fillna(0.0) >= 0.5
-    df["verified_success"] = df["agreement_bucket"] == "consistent_pass"
+    verified = pd.Series(pd.NA, index=df.index, dtype="boolean")
+    source = pd.Series("unresolved", index=df.index, dtype="string")
+    passed = df["structural_verdict"] == "constant_equivalent"
+    failed = df["structural_verdict"] == "structurally_different"
+    verified.loc[passed] = True
+    verified.loc[failed] = False
+    source.loc[passed | failed] = "deterministic_symbolic"
+
+    if adjudications is not None and not adjudications.empty:
+        cols = ["path", "adjudicated_success", "adjudicator"]
+        labels = adjudications[cols].rename(columns={"adjudicator": "_adjudicator"})
+        df = df.merge(labels, on="path", how="left")
+        mask = df["adjudicated_success"].notna()
+        verified.loc[mask] = df.loc[mask, "adjudicated_success"].astype(bool).to_numpy()
+        source.loc[mask] = ("adjudication:" +
+                            df.loc[mask, "_adjudicator"].fillna("unspecified").astype(str))
+        df = df.drop(columns=["_adjudicator"])
+
+    df["verified_success"] = verified
+    df["verification_source"] = source
+    df["verification_resolved"] = verified.notna()
     return df
 
 
@@ -364,14 +525,16 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
 # verified_success label passing: diagnostics writes it, scoreboard reads it
 # ---------------------------------------------------------------------------
 
-def verdicts_csv_path(model: str, budget: bool = False) -> str:
-    return analysis_path(f"verdicts_{model}{'_budget' if budget else ''}.csv")
+def verdicts_csv_path(model: str, budget: bool = False,
+                      result_dir: Optional[str] = None) -> str:
+    return analysis_path(f"verdicts_{model}{result_run_suffix(budget, result_dir)}.csv")
 
 
-def load_verified_labels(model: str, budget: bool = False) -> Optional[pd.DataFrame]:
+def load_verified_labels(model: str, budget: bool = False,
+                         result_dir: Optional[str] = None) -> Optional[pd.DataFrame]:
     """The per-trial verified_success table diagnostics.py's `verdicts`
     subcommand writes. None if it was never run for this model."""
-    p = verdicts_csv_path(model, budget)
+    p = verdicts_csv_path(model, budget, result_dir)
     if not os.path.exists(p):
         return None
     return pd.read_csv(p)
@@ -399,12 +562,11 @@ def read_models_from_file(models_file: Path) -> List[str]:
 
 
 def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_TRIAL_CSV):
-    """Compile every non-fail trial JSON for one model into results_by_trial.csv,
-    upserting on the logical-config key (so re-running is idempotent)."""
+    """Compile the protocol-defined completed trials into results_by_trial.csv."""
     base_cols = [
-        "trial_id", "module", "model_name", "noise_level", "equation_difficulty", "model_system",
+        "path", "file_sha256", "trial_id", "module", "model_name", "noise_level", "equation_difficulty", "model_system",
         "law_version", "agent_backend", "rmsle", "exact_accuracy", "rounds",
-        "experiments", "total_tokens", "file_version",
+        "experiments", "total_tokens", "file_version", "status", "evaluation_error",
     ] + BUDGET_COLS
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
@@ -425,63 +587,30 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
         print(f"Directory not found for model: {model_name}")
         return
 
-    for module in os.listdir(model_dir):
-        module_path = os.path.join(model_dir, module)
-        if not os.path.isdir(module_path):
-            continue
-        for root, dirs, _files in os.walk(module_path):
-            if "trials" not in dirs:
-                continue
-            trials_dir = os.path.join(root, "trials")
-            for file in os.listdir(trials_dir):
-                if not file.endswith(".json") or "fail" in file:
-                    continue
-                m = re.search(r"trial(\d+)", file)
-                if not m:
-                    continue
-                with open(os.path.join(trials_dir, file)) as f:
-                    data = json.load(f)
-                new_row = {
-                    "trial_id": int(m.group(1)),
-                    "module": data.get("module_name"),
-                    "model_name": data.get("model_name"),
-                    "noise_level": data.get("noise_level"),
-                    "equation_difficulty": data.get("equation_difficulty"),
-                    "model_system": data.get("model_system"),
-                    "law_version": data.get("law_version"),
-                    "agent_backend": data.get("agent_backend"),
-                    "rmsle": data.get("evaluation", {}).get("rmsle"),
-                    "exact_accuracy": data.get("evaluation", {}).get("exact_accuracy"),
-                    "rounds": data.get("rounds"),
-                    "experiments": data.get("num_experiments"),
-                    "total_tokens": data.get("total_tokens"),
-                    "file_version": extract_version_from_path(root),
-                    **_budget_from_trial(data),
-                }
-                mask = (
-                    (df["trial_id"] == new_row["trial_id"])
-                    & (df["module"] == new_row["module"])
-                    & (df["model_name"] == new_row["model_name"])
-                    & (df["noise_level"] == new_row["noise_level"])
-                    & (df["equation_difficulty"] == new_row["equation_difficulty"])
-                    & (df["model_system"] == new_row["model_system"])
-                    & (df["law_version"] == new_row["law_version"])
-                    & (df["agent_backend"] == new_row["agent_backend"])
-                )
-                if mask.any():
-                    df.loc[mask, list(new_row.keys())] = list(new_row.values())
-                else:
-                    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-
-    config_cols = ["module", "model_name", "noise_level", "equation_difficulty",
-                   "model_system", "law_version", "agent_backend"]
-    present = [c for c in config_cols if c in df.columns]
-    if present:
-        max_trials = 4
-        df = (df.sort_values("trial_id", ascending=False)
-                .groupby(present, dropna=False)
-                .head(max_trials)
-                .sort_index())
+    trials = load_trials(result_dir, model_name, include_fails=False,
+                         max_trials_per_config=TARGET_TRIALS_PER_CONFIG)
+    fresh = pd.DataFrame({
+        "path": trials["path"],
+        "file_sha256": trials["file_sha256"],
+        "trial_id": trials["trial_id"],
+        "module": trials["module"],
+        "model_name": trials["model_name"].fillna(model_name),
+        "noise_level": trials["noise_level"],
+        "equation_difficulty": trials["equation_difficulty"],
+        "model_system": trials["model_system"],
+        "law_version": trials["law_version"],
+        "agent_backend": trials["agent_backend"],
+        "rmsle": trials["rmsle"],
+        "exact_accuracy": trials["exact_accuracy"].fillna(0.0),
+        "rounds": trials["rounds"],
+        "experiments": trials["num_experiments"],
+        "total_tokens": trials["total_tokens"],
+        "file_version": trials["path_version"].map(lambda v: f"v{int(v)}"),
+        "status": trials["status"],
+        "evaluation_error": trials["evaluation_error"],
+        **{c: trials[c] for c in BUDGET_COLS},
+    })
+    df = pd.concat([df, fresh], ignore_index=True)
 
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     df.to_csv(csv_path, index=False)
@@ -489,7 +618,12 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
 
 
 def calculate_trial_stats(df):
-    """Mean/std of per-trial mean accuracy & rmsle (the paper's trial-then-mean)."""
+    """Accuracy and RMSLE summaries with independent missing-data policies.
+
+    Missing accuracy is a failed completed trial and therefore 0. Missing RMSLE
+    is unavailable only for the RMSLE summary; it never changes the accuracy
+    denominator.
+    """
     if df.empty:
         return np.nan, np.nan, np.nan, np.nan
     group_cols = [c for c in ["module", "equation_difficulty", "model_system",
@@ -497,16 +631,18 @@ def calculate_trial_stats(df):
                   if c in df.columns]
     if not group_cols:
         group_cols = ["trial_id"]
-    trial_means = df.groupby(group_cols).agg(
-        mean_accuracy=("exact_accuracy", "mean"),
-        mean_rmsle=("rmsle", "mean"),
-    ).dropna()
-    if trial_means.empty:
+    work = df.copy()
+    work["exact_accuracy"] = pd.to_numeric(work["exact_accuracy"], errors="coerce").fillna(0.0)
+    work["rmsle"] = pd.to_numeric(work["rmsle"], errors="coerce").replace(
+        [np.inf, -np.inf], np.nan)
+    acc_means = work.groupby(group_cols, dropna=False)["exact_accuracy"].mean()
+    rmsle_means = work.groupby(group_cols, dropna=False)["rmsle"].mean().dropna()
+    if acc_means.empty:
         return np.nan, np.nan, np.nan, np.nan
-    ma = trial_means["mean_accuracy"].mean()
-    sa = trial_means["mean_accuracy"].std()
-    mr = trial_means["mean_rmsle"].mean()
-    sr = trial_means["mean_rmsle"].std()
+    ma = acc_means.mean()
+    sa = acc_means.std()
+    mr = rmsle_means.mean() if not rmsle_means.empty else np.nan
+    sr = rmsle_means.std() if not rmsle_means.empty else np.nan
     return ma, (0 if np.isnan(sa) else sa), mr, (0 if np.isnan(sr) else sr)
 
 

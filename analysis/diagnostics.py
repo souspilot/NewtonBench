@@ -10,7 +10,7 @@ Subcommands (all take --model, --result_dir, --subset_file, --agent, --module):
              WRITES analysis/verdicts_<model>.csv -- the per-trial
              verified_success label scoreboard.py picks up.
 
-  mistakes   For trials that are genuinely wrong (judge AND sympy agree),
+  mistakes   For trials with a resolved symbolic failure, classify HOW
              classify HOW (missing variable / wrong exponent / sign flip /
              ...), with sampled example laws per bucket.
 
@@ -32,9 +32,7 @@ import argparse
 import json
 import os
 import re
-import statistics
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +41,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from newton_common import (  # noqa: E402
     load_trials, filter_to_subset, clean_rmsle_outliers, compute_verdicts, time_limit,
-    verdicts_csv_path, load_verified_labels, analysis_path, resolve_result_dir,
+    verdicts_csv_path, load_verified_labels, load_adjudications, analysis_path, resolve_result_dir,
+    result_run_suffix,
     DEFAULT_RMSLE_THRESHOLD, DEFAULT_SYMPY_TIMEOUT, MAX_TURNS,
     MODULE_SHORT, SYS_SHORT, AGENT_SHORT, MODULE_ORDER, DIFFICULTIES, SYSTEMS,
 )
@@ -53,10 +52,11 @@ from newton_common import (  # noqa: E402
 # shared frame prep
 # ===========================================================================
 
-VERDICT_COLS = ["path", "module", "equation_difficulty", "model_system", "law_version",
+VERDICT_COLS = ["path", "file_sha256", "module", "equation_difficulty", "model_system", "law_version",
                 "agent_backend", "trial_id", "is_fail", "status", "rounds", "num_experiments",
                 "total_tokens", "rmsle", "exact_accuracy", "judge_verdict", "rmsle_verdict",
                 "structural_verdict", "agreement_bucket", "raw_success", "verified_success",
+                "verification_source", "verification_resolved", "adjudicated_success",
                 "symbolic_msg", "submitted_law", "ground_truth_law",
                 "budget_spent", "funds_remaining", "budget_overdraft", "budget_overspent",
                 "num_billed_requests", "starting_funds"]
@@ -64,7 +64,7 @@ VERDICT_COLS = ["path", "module", "equation_difficulty", "model_system", "law_ve
 
 def _tag(args) -> str:
     """Filename suffix so budgeted analysis outputs don't overwrite standard ones."""
-    return "_budget" if getattr(args, "budget", False) else ""
+    return result_run_suffix(getattr(args, "budget", False), getattr(args, "result_dir", None))
 
 
 def _load_filtered(args, include_fails: bool) -> pd.DataFrame:
@@ -82,9 +82,13 @@ def _load_filtered(args, include_fails: bool) -> pd.DataFrame:
 def compute_and_write_verdicts(args) -> pd.DataFrame:
     """The one expensive sympy pass. `verdicts` calls it directly; `mistakes`
     and `trace` go through verdict_frame() which reuses the written CSV."""
-    df = compute_verdicts(_load_filtered(args, include_fails=True),
-                          args.rmsle_threshold, getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT))
-    out = verdicts_csv_path(args.model, args.budget)
+    # Runner/API failures are operational attempts, not completed scientific
+    # trajectories. Scoreboard reports them separately.
+    adjudications = load_adjudications(getattr(args, "adjudications", None))
+    df = compute_verdicts(_load_filtered(args, include_fails=False),
+                          args.rmsle_threshold, getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT),
+                          adjudications=adjudications)
+    out = verdicts_csv_path(args.model, args.budget, args.result_dir)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df[[c for c in VERDICT_COLS if c in df.columns]].to_csv(out, index=False)
     return df
@@ -94,13 +98,24 @@ def verdict_frame(args) -> pd.DataFrame:
     """Per-trial verdict table for `mistakes` / `trace`: reuse verdicts_<model>.csv
     if it exists and still covers every filtered trial, else run (and cache) the
     sympy pass. Avoids paying for structural checks 3x in `all`."""
-    cached = load_verified_labels(args.model, args.budget)
+    cached = load_verified_labels(args.model, args.budget, args.result_dir)
+    if getattr(args, "adjudications", None):
+        return compute_and_write_verdicts(args)
     if cached is not None:
-        want = _load_filtered(args, include_fails=True)
+        want = _load_filtered(args, include_fails=False)
+        if "file_sha256" not in cached.columns:
+            print("(verdicts CSV predates content hashing -- recomputing)")
+            return compute_and_write_verdicts(args)
+        want_keys = set(map(tuple, want[["path", "file_sha256"]].astype(str).to_numpy()))
+        cached_keys = set(map(tuple, cached[["path", "file_sha256"]].astype(str).to_numpy()))
+        if not want_keys.issubset(cached_keys):
+            print("(verdicts CSV is stale: source trial content changed -- recomputing)")
+            return compute_and_write_verdicts(args)
         merged = want.drop(columns=[c for c in cached.columns if c != "path" and c in want.columns]) \
                      .merge(cached, on="path", how="left")
         if merged["agreement_bucket"].notna().all():
-            print(f"(reusing {verdicts_csv_path(args.model, args.budget)} -- run `diagnostics.py verdicts` to refresh)")
+            print(f"(reusing {verdicts_csv_path(args.model, args.budget, args.result_dir)} -- "
+                  f"run `diagnostics.py verdicts` to refresh)")
             return merged
         print("(verdicts CSV is stale / missing rows -- recomputing)")
     return compute_and_write_verdicts(args)
@@ -110,16 +125,26 @@ def cmd_verdicts(args):
     df = compute_and_write_verdicts(args)
 
     print(f"\n{'='*70}\nVerdicts: {args.model}   (n={len(df)})\n{'='*70}")
-    print("agreement_bucket trusts the deterministic sympy structural check whenever it "
-          "reached a verdict;\nthe RMSLE threshold only decides not_checkable rows.")
+    print("Deterministic symbolic checking supplies the primary label. Uncheckable rows "
+          "remain unresolved\nunless supplied through --adjudications; RMSLE and the original "
+          "LLM judge are diagnostics only.")
 
     print("\n=== Agreement bucket counts ===")
     print(df["agreement_bucket"].value_counts().to_string())
     n = len(df)
-    print(f"\nraw success (judge/exact_accuracy): {100*df['raw_success'].mean():.1f}%")
-    print(f"verified success (judge AND sympy): {100*df['verified_success'].mean():.1f}%")
-    flipped = int((df["raw_success"] != df["verified_success"]).sum())
-    print(f"{flipped}/{n} trials differ between the two labels.")
+    print(f"\nraw success (original judge/exact_accuracy): {100*df['raw_success'].mean():.1f}%")
+    resolved = df["verification_resolved"].fillna(False)
+    successes = int(df["verified_success"].fillna(False).sum())
+    unresolved = int((~resolved).sum())
+    print(f"resolved symbolic labels: {int(resolved.sum())}/{n} ({100*resolved.mean():.1f}% coverage)")
+    if resolved.any():
+        print(f"success among resolved: {100*df.loc[resolved, 'verified_success'].mean():.1f}%")
+    print(f"all-trial success interval: {100*successes/n:.1f}-{100*(successes+unresolved)/n:.1f}% "
+          f"({unresolved} unresolved)")
+    comparable = resolved
+    flipped = int((df.loc[comparable, "raw_success"].astype(bool) !=
+                   df.loc[comparable, "verified_success"].astype(bool)).sum())
+    print(f"{flipped}/{int(comparable.sum())} resolved trials differ from the original judge label.")
 
     lenient = df[df["agreement_bucket"] == "judge_lenient"]
     strict = df[df["agreement_bucket"] == "judge_strict"]
@@ -134,14 +159,9 @@ def cmd_verdicts(args):
         # almost always a sympy miss (really a pass), not a judge error.
         likely_sympy_miss = int((lenient["rmsle"] < 1e-6).sum())
         likely_judge_err = len(lenient) - likely_sympy_miss
-        base = int(df["verified_success"].sum())
-        n = len(df)
-        print(f"\n  of {len(lenient)} judge_lenient: ~{likely_sympy_miss} have RMSLE<1e-6 "
-              f"(numerically exact -> almost certainly a sympy-miss, really a pass), "
-              f"~{likely_judge_err} have RMSLE>=1e-6 (likely real judge error).")
-        print(f"  => verified SA {100*base/n:.1f}% is a LOWER bound; "
-              f"corrected band ~{100*base/n:.1f}-{100*(base+likely_sympy_miss)/n:.1f}%. "
-              f"Eyeball the RMSLE-sorted table below.")
+        print(f"\n  of {len(lenient)} judge_lenient: {likely_sympy_miss} have RMSLE<1e-6 and "
+              f"{likely_judge_err} have RMSLE>=1e-6. These are audit signals only; the "
+              f"deterministic verdict remains the label unless explicitly adjudicated.")
 
     print("\n=== Breakdown by module ===")
     print(pd.crosstab(df["module"], df["agreement_bucket"]).to_string())
@@ -158,8 +178,23 @@ def cmd_verdicts(args):
         print(f"\n=== Top {min(args.top, len(strict))} judge_strict (lowest RMSLE = likely false negative) ===")
         print(strict.sort_values("rmsle")[show + ["structural_verdict"]].head(args.top).to_string(index=False))
 
-    print(f"\nPer-trial verified_success labels written to {verdicts_csv_path(args.model, args.budget)} "
+    print(f"\nPer-trial verified_success labels written to "
+          f"{verdicts_csv_path(args.model, args.budget, args.result_dir)} "
           f"(scoreboard.py --verified and the other subcommands read this).")
+    unresolved_rows = df[~df["verification_resolved"].fillna(False)].copy()
+    if not unresolved_rows.empty:
+        review_path = analysis_path(f"unresolved_{args.model}{_tag(args)}.csv")
+        review_rows = unresolved_rows[[
+            "path", "module", "equation_difficulty", "model_system", "law_version",
+            "agent_backend", "trial_id", "submitted_law", "ground_truth_law",
+            "judge_verdict", "rmsle", "structural_verdict",
+        ]].copy()
+        review_rows["adjudicated_success"] = ""
+        review_rows["adjudicator"] = ""
+        review_rows["notes"] = ""
+        review_rows.to_csv(review_path, index=False)
+        print(f"Unresolved review template written to {review_path}. Fill its label/adjudicator "
+              f"columns, then rerun with --adjudications {review_path}.")
 
 
 # ===========================================================================
@@ -183,9 +218,10 @@ def cmd_mistakes(args):
     from mismatch_classifier import classify_mismatch
 
     df = verdict_frame(args)
-    fails = df[df["agreement_bucket"] == "consistent_fail"].copy()
+    fails = df[(df["verification_resolved"].fillna(False)) &
+               (~df["verified_success"].fillna(False))].copy()
     if fails.empty:
-        raise SystemExit("No consistent_fail trials -- nothing to classify.")
+        raise SystemExit("No resolved symbolic failures -- nothing to classify.")
 
     # classify once per unique (submitted, ground_truth) pair, each call time-limited
     # (mismatch_classifier's sp.simplify can hang on nested exp/log/power forms).
@@ -444,10 +480,12 @@ def _trace_report(df, label, example_sink):
 
     # stash an example failing trajectory for each signal (printed once, at top level)
     for sig, mask in [
-        ("reasoning blowup (longest msg, a failure)",
-         (~df["verified_success"]) & df["max_msg_chars"].notna()),
-        ("format failure (a failure)", (~df["verified_success"]) & df["had_format_failure"].fillna(False)),
-        ("unverified submit (a failure)", (~df["verified_success"]) & df["unverified_submit"].fillna(False)),
+        ("reasoning blowup (longest msg, a resolved failure)",
+         (~df["verified_success"].fillna(True)) & df["max_msg_chars"].notna()),
+        ("format failure (a resolved failure)",
+         (~df["verified_success"].fillna(True)) & df["had_format_failure"].fillna(False)),
+        ("unverified submit (a resolved failure)",
+         (~df["verified_success"].fillna(True)) & df["unverified_submit"].fillna(False)),
         ("no parseable final_law", df["no_parseable_law"].fillna(False)),
     ]:
         cand = df[mask]
@@ -474,10 +512,18 @@ def cmd_trace(args):
     traces = pd.DataFrame(recs)
     merged = df.merge(traces, on="path", how="left")
 
+    resolved = merged[merged["verified_success"].notna()].copy()
+    unresolved_n = len(merged) - len(resolved)
+    if unresolved_n:
+        print(f"(excluding {unresolved_n} unresolved symbolic labels from outcome-conditioned "
+              f"trace statistics; they remain in the exported table)")
+    if resolved.empty:
+        raise SystemExit("No resolved symbolic labels available for trace/outcome analysis.")
+
     examples = {}
-    _trace_report(merged, f"Trace: {args.model}", examples)
+    _trace_report(resolved, f"Trace: {args.model}", examples)
     if args.agent is None:
-        for backend, g in merged.groupby("agent_backend", observed=True):
+        for backend, g in resolved.groupby("agent_backend", observed=True):
             _trace_report(g, f"{args.model} / {backend}", examples)
 
     if examples:
@@ -493,90 +539,60 @@ def cmd_trace(args):
 
 
 # ===========================================================================
-# agents  (divergence)
+# agents (resolved-label divergence)
 # ===========================================================================
 
-def _load_agent_trials(base_dir, model):
-    """(agent, module, difficulty, version, system) -> list of trial dicts, raw
-    (no dedup -- versions are a real axis here)."""
-    trials = defaultdict(list)
-    model_dir = Path(base_dir) / model
-    if not model_dir.exists():
-        raise SystemExit(f"{model_dir} not found")
-    for tf in model_dir.rglob("trials/trial*.json"):
-        if "_chat_history" in tf.name or tf.name.endswith("_fail.json"):
-            continue
-        try:
-            data = json.load(open(tf))
-        except Exception:  # noqa: BLE001
-            continue
-        data["_chat_log"] = str(tf).replace(".json", "_chat_history.log")
-        key = (data.get("agent_backend"), data.get("module_name"), data.get("equation_difficulty"),
-               data.get("law_version"), data.get("model_system"))
-        trials[key].append(data)
-    return trials
-
-
-def _acc(t):
-    ev = t.get("evaluation", {})
-    return float(ev.get("exact_accuracy", 0.0)) if isinstance(ev, dict) else 0.0
-
-
 def cmd_agents(args):
-    trials = _load_agent_trials(args.result_dir, args.model)
-    if args.subset_file:
-        from newton_common import load_subset_cells
-        cells = load_subset_cells(args.subset_file)
-        trials = {k: v for k, v in trials.items()
-                  if cells and (k[2], k[4]) in cells.get(k[1], set())}
-    agents = sorted({k[0] for k in trials if k[0]})
+    df = verdict_frame(args)
+    unresolved = df["verified_success"].isna()
+    if unresolved.any():
+        raise SystemExit(
+            f"Agent comparison refused: {int(unresolved.sum())}/{len(df)} trials are unresolved. "
+            "Complete the adjudication workflow first; comparing only checkable rows is biased."
+        )
+    df = df.copy()
+    df["verified_success"] = df["verified_success"].astype(float)
+    agents = sorted(df["agent_backend"].dropna().unique())
     print(f"\n{'='*78}\nAgent comparison: {args.model}   agents={agents}\n{'='*78}")
 
-    # per (system, difficulty) SA per agent
-    agg = defaultdict(list)
-    for (agent, module, diff, ver, sysd), tl in trials.items():
-        for t in tl:
-            agg[(agent, sysd, diff)].append(_acc(t))
     print(f"\n  {'System':<7} {'Diff':<7} " + " ".join(f"{AGENT_SHORT.get(a, a):>9}" for a in agents))
     for sysd in SYSTEMS:
         for diff in DIFFICULTIES:
-            cells = [agg.get((a, sysd, diff), []) for a in agents]
-            if not any(cells):
+            cells = [df[(df["agent_backend"] == a) & (df["model_system"] == sysd) &
+                        (df["equation_difficulty"] == diff)]["verified_success"] for a in agents]
+            if not any(len(cell) for cell in cells):
                 continue
             print(f"  {SYS_SHORT[sysd]:<7} {diff:<7} " +
-                  " ".join(f"{100*statistics.mean(c):>9.1f}" if c else f"{'-':>9}" for c in cells))
+                  " ".join(f"{100*cell.mean():>9.1f}" if len(cell) else f"{'-':>9}"
+                           for cell in cells))
     for a in agents:
-        allv = [x for k, v in agg.items() if k[0] == a for x in v]
-        if allv:
-            print(f"  overall {AGENT_SHORT.get(a, a):<15} {100*statistics.mean(allv):.1f}%  (n={len(allv)})")
+        values = df[df["agent_backend"] == a]["verified_success"]
+        if len(values):
+            print(f"  overall {AGENT_SHORT.get(a, a):<15} {100*values.mean():.1f}%  "
+                  f"(n={len(values)})")
 
-    # divergences: same config, agents disagree
-    by_config = defaultdict(dict)
-    for (agent, module, diff, ver, sysd), tl in trials.items():
-        accs = [_acc(t) for t in tl]
-        by_config[(module, diff, ver, sysd)][agent] = (statistics.mean(accs) if accs else 0.0, tl)
+    keys = ["module", "equation_difficulty", "law_version", "model_system"]
+    scores = (df.groupby(keys + ["agent_backend"], dropna=False)["verified_success"]
+                .mean().unstack("agent_backend"))
     divs = []
-    for (module, diff, ver, sysd), per_agent in by_config.items():
-        names = list(per_agent)
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                a1, a2 = names[i], names[j]
-                s1, s2 = per_agent[a1][0], per_agent[a2][0]
+    for (module, diff, ver, sysd), row in scores.iterrows():
+        present = row.dropna()
+        names = list(present.index)
+        for i, a1 in enumerate(names):
+            for a2 in names[i + 1:]:
+                s1, s2 = float(present[a1]), float(present[a2])
                 if abs(s1 - s2) > 0.01:
                     w, l = (a1, a2) if s1 > s2 else (a2, a1)
                     divs.append(dict(module=module, diff=diff, ver=ver, sys=sysd, winner=w, loser=l,
-                                     w_sa=max(s1, s2), l_sa=min(s1, s2),
-                                     w_tl=per_agent[w][1], l_tl=per_agent[l][1]))
+                                     w_sa=max(s1, s2), l_sa=min(s1, s2)))
     divs.sort(key=lambda d: d["w_sa"] - d["l_sa"], reverse=True)
 
     print(f"\n--- {len(divs)} divergent configs (agents disagree) ---")
-    wins = defaultdict(lambda: defaultdict(int))
-    for d in divs:
-        wins[d["winner"]][d["loser"]] += 1
     for w in agents:
         for l in agents:
-            if wins[w][l]:
-                print(f"  {AGENT_SHORT.get(w, w)} beats {AGENT_SHORT.get(l, l)}: {wins[w][l]}")
+            wins = sum(d["winner"] == w and d["loser"] == l for d in divs)
+            if wins:
+                print(f"  {AGENT_SHORT.get(w, w)} beats {AGENT_SHORT.get(l, l)}: {wins}")
     for d in divs[:args.top]:
         print(f"  {MODULE_SHORT.get(d['module'], d['module']):<9} {SYS_SHORT[d['sys']]:<6} "
               f"{d['diff']:<7} {d['ver']:<3} | {AGENT_SHORT.get(d['winner'], d['winner']):>8} "
@@ -591,17 +607,15 @@ def cmd_agents(args):
         with open(outdir / fn, "w") as f:
             f.write(f"{d['module']} / {d['sys']} / {d['diff']} / {d['ver']}\n")
             f.write(f"WINNER {d['winner']} SA={100*d['w_sa']:.1f}   LOSER {d['loser']} SA={100*d['l_sa']:.1f}\n\n")
-            for tag, tl in [("WINNER", d["w_tl"]), ("LOSER", d["l_tl"])]:
+            case = df[(df["module"] == d["module"]) &
+                      (df["model_system"] == d["sys"]) &
+                      (df["equation_difficulty"] == d["diff"]) &
+                      (df["law_version"] == d["ver"])]
+            for tag, agent in [("WINNER", d["winner"]), ("LOSER", d["loser"])]:
                 f.write(f"--- {tag} laws ---\n")
-                for t in tl:
-                    f.write(f"  trial{t.get('trial_id')}: acc={_acc(t)}  {t.get('submitted_law')}\n")
-            for t in d["l_tl"]:
-                cl = t.get("_chat_log", "")
-                if cl and os.path.exists(cl):
-                    f.write(f"\n--- LOSER trial{t.get('trial_id')} chat ---\n")
-                    c = open(cl).read()
-                    f.write(c if len(c) < 20000 else c[:10000] + "\n...[TRUNCATED]...\n" + c[-10000:])
-                    break
+                for _, trial in case[case["agent_backend"] == agent].iterrows():
+                    f.write(f"  trial{trial['trial_id']}: acc={int(trial['verified_success'])}  "
+                            f"{trial['submitted_law']}\n    {trial['path']}\n")
         manifest.append({"file": fn, **{k: d[k] for k in ("module", "sys", "diff", "ver")},
                          "winner": d["winner"], "loser": d["loser"],
                          "gap": f"{100*(d['w_sa']-d['l_sa']):+.1f}"})
@@ -622,8 +636,9 @@ def main():
         p.add_argument("--result_dir", default=None,
                        help="default: evaluation_results, or the budgeted tree when --budget is set")
         p.add_argument("--budget", action="store_true",
-                       help="analyse a budgeted run: read the budget results tree, use a separate "
-                            "verdicts_<model>_budget.csv, and add a budget-vs-outcome block to `trace`")
+                       help="analyse a budgeted run: read the budget results tree, use "
+                            "result-tree-specific verdict files, and add a budget-vs-outcome "
+                            "block to `trace`")
         p.add_argument("--budget-config", default=None,
                        help="Budget run JSON whose results_dir should be analysed; also enables --budget")
         p.add_argument("--subset_file", default=None,
@@ -635,6 +650,9 @@ def main():
         p.add_argument("--sympy_timeout", type=float, default=DEFAULT_SYMPY_TIMEOUT,
                        help="seconds per unique law pair before the structural / classify "
                             "check bails to not_checkable (0 disables)")
+        p.add_argument("--adjudications", default=None,
+                       help="CSV with path,adjudicated_success and optional adjudicator/notes. "
+                            "Use for human or independent locally-hosted-judge labels.")
         p.add_argument("--top", type=int, default=15)
         if name in ("mistakes", "all"):
             p.add_argument("--samples", type=int, default=8)

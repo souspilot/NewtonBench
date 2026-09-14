@@ -387,24 +387,26 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
         except (json.JSONDecodeError, OSError):
             print(f"WARNING: skipping unreadable fail file {os.path.basename(p)}")
 
-    all_results = valid_results + failed_results
+    operational_attempts = valid_results + failed_results
 
     if not valid_results:
         print(f"\nAll trials for law_version '{law_version}' failed. Please check the logs in '{results_dir}'.")
         return
 
-    # Calculate metrics for all trials (including failed ones)
-    all_rmsle_scores = np.array([r['evaluation']['rmsle'] for r in all_results])
-    all_accuracies = np.array([r['evaluation']['exact_accuracy'] for r in all_results])
-    all_turns = np.array([r['rounds'] for r in all_results if "error" not in r])
-    all_experiments_used = np.array([r['num_experiments'] for r in all_results if "error" not in r])
-    all_tokens_used = np.array([r['total_tokens'] for r in all_results if "error" not in r])
+    # Scientific metrics use completed trajectories only. Retry-exhaustion
+    # records are operational failures and are reported separately below.
+    all_rmsle_scores = np.array([r['evaluation']['rmsle'] for r in valid_results])
+    all_accuracies = np.array([r['evaluation'].get('exact_accuracy', 0.0)
+                               for r in valid_results])
+    all_turns = np.array([r['rounds'] for r in valid_results])
+    all_experiments_used = np.array([r['num_experiments'] for r in valid_results])
+    all_tokens_used = np.array([r['total_tokens'] for r in valid_results])
 
     # Filter out non-finite values for accurate statistics
     finite_all_rmsle = all_rmsle_scores[np.isfinite(all_rmsle_scores)]
     
     # Calculate retry statistics for all trials
-    all_retry_attempts = [r.get('retry_attempts', 0) for r in all_results]
+    all_retry_attempts = [r.get('retry_attempts', 0) for r in operational_attempts]
     total_retries = sum(all_retry_attempts)
     trials_with_retries = sum(1 for attempts in all_retry_attempts if attempts > 0)
 
@@ -442,7 +444,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     print(f"  - Total Runtime: {end_time - start_time:.2f} seconds")
     print(f"  - Backend: {cli_args.agent_backend}")
     print("-"*50)
-    print("Aggregated Results (All Trials):")
+    print("Aggregated Results (Completed Scientific Trials):")
     print(f"  - Average Raw RMSLE: {np.nanmean(finite_all_rmsle):.4f}")
     print(f"  - Average Exact Accuracy: {np.mean(all_accuracies):.2%}")
     print(f"  - Average Rounds to Completion: {np.mean(all_turns):.2f}")
@@ -451,7 +453,7 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
     print("-"*50)      
     print(f"  - Retry Statistics:")
     print(f"    * Total Retry Attempts: {total_retries}")
-    print(f"    * Trials with Retries: {trials_with_retries}/{len(all_results)} ({trials_with_retries/len(all_results)*100:.1f}%)" if all_results else "    * Trials with Retries: 0/0")
+    print(f"    * Trials with Retries: {trials_with_retries}/{len(operational_attempts)} ({trials_with_retries/len(operational_attempts)*100:.1f}%)" if operational_attempts else "    * Trials with Retries: 0/0")
     print(f"    * Average Retries per Trial: {np.mean(all_retry_attempts):.2f}")
     print(f"    * Failed Trials (after all retries): {len(failed_results)}")
     if budget_stats:
@@ -484,21 +486,24 @@ def run_experiment_for_version(cli_args, module, law_version, num_trials):
             "runtime_seconds": end_time - start_time
         },
         "aggregate": {
-            # Metrics for all trials
+            # Metrics for completed scientific trajectories only. The legacy
+            # key name is retained for downstream compatibility.
             "all_trials": {
                 "average_rmsle": float(np.nanmean(finite_all_rmsle)),
                 "average_exact_accuracy": float(np.mean(all_accuracies)),
                 "average_rounds": float(np.mean(all_turns)),
                 "average_experiments": float(np.mean(all_experiments_used)),
                 "average_total_tokens": float(np.mean(all_tokens_used)),
-                "num_total_trials": len(all_results)
+                "num_total_trials": len(valid_results),
+                "denominator_policy": "latest completed trajectories; runner failures excluded"
             },
             "retry_statistics": {
                 "total_retry_attempts": total_retries,
                 "trials_with_retries": trials_with_retries,
-                "trials_with_retries_percentage": float(trials_with_retries/len(all_results)*100) if all_results else 0.0,
+                "trials_with_retries_percentage": float(trials_with_retries/len(operational_attempts)*100) if operational_attempts else 0.0,
                 "average_retries_per_trial": float(np.mean(all_retry_attempts)),
-                "failed_trials_after_retries": len(failed_results)
+                "failed_trials_after_retries": len(failed_results),
+                "num_operational_attempts_on_disk": len(operational_attempts)
             },
             "budget_statistics": budget_stats,
         },

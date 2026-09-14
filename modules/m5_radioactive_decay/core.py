@@ -174,7 +174,7 @@ def evaluate_law(
     param_description: str,
     difficulty: str = 'easy',
     law_version: str = None,
-    judge_model_name: str = "nemotron-ultra",
+    judge_model_name: str = None,
     trial_info=None,
 ) -> dict:
     """
@@ -231,4 +231,3 @@ def evaluate_law(
         trial_info=trial_info,
         symbolic_check=True
     )
-

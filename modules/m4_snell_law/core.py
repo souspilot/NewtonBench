@@ -149,7 +149,7 @@ def evaluate_law(
     param_description: str,
     difficulty: str = 'easy',
     law_version: Optional[str] = None,
-    judge_model_name: str = "nemotron-ultra",
+    judge_model_name: str = None,
     trial_info=None,
 ) -> dict:
     """Evaluator for the Snell's Law module."""
@@ -182,4 +182,4 @@ def evaluate_law(
         judge_model_name=judge_model_name,
         trial_info=trial_info, 
         symbolic_check=True
-    ) 
+    )

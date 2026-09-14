@@ -58,14 +58,18 @@ the standard `evaluation_results/`. The analysis scripts take a matching
 `--budget` flag:
 
 ```bash
-python analysis/scoreboard.py  --model qwen38-27b --budget          # + a grant-economics section
-python analysis/diagnostics.py trace --model qwen38-27b --budget    # + budget-vs-outcome block
-python analysis/rejudge.py     --model qwen38-27b --budget --judge gpt41
+python analysis/diagnostics.py verdicts --model qwen38-27b --budget
+python analysis/scoreboard.py  --model qwen38-27b --budget --verified
+# Optional audit judge: use an independent local model that fits <=2x A100-80GB.
+python analysis/rejudge.py --model qwen38-27b --budget --judge muse-glimmer-30b
 ```
 
 `--budget` points each script at the budget tree, keeps its bookkeeping in
-separate files (`results_by_trial_budget.csv`, `verdicts_<model>_budget.csv`), and
+separate result-tree-specific files (for example,
+`results_by_trial_budget_evaluation_results_400_cap.csv`), and
 surfaces the per-trial spend / funds-remaining / overspent numbers.
+See `analysis/SCORING_PROTOCOL.md` for unresolved-case adjudication and the
+publication-safe scoring workflow.
 
 ## Editing costs — `budget.json`
 

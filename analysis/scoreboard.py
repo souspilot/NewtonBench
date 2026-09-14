@@ -6,9 +6,9 @@ module, and by agent, plus coverage and a resource quick-look.
 No sympy, no transcript parsing. For "where is the model going wrong",
 "is that 90% judge-inflated", mistake taxonomy, etc. -> diagnostics.py.
 
-verified_success: raw exact-accuracy is what this reads by default. If you've
-run `diagnostics.py verdicts --model X` it wrote analysis/verdicts_X.csv;
-pass --verified here to show the sympy-checked number next to raw.
+Raw exact-accuracy is provisional original-judge scoring. For publication,
+run `diagnostics.py verdicts --model X`, explicitly adjudicate every unresolved
+row, then pass --verified. Publication mode fails closed if any label is absent.
 
 Usage:
     python analysis/scoreboard.py --model qwen38-27b
@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from newton_common import (  # noqa: E402
     update_results, filter_to_subset, clean_rmsle_outliers, detect_outliers_modified_zscore_column,
     calculate_trial_stats, load_results_by_trial, load_verified_labels, read_models_from_file,
-    resolve_result_dir, results_by_trial_csv,
+    resolve_result_dir, results_by_trial_csv, load_trial_failures, verdicts_csv_path,
     DIFFICULTIES, SYSTEMS, MODULE_ORDER,
 )
 
@@ -39,6 +39,45 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     for _, g in df.groupby(["module", "equation_difficulty", "model_system", "agent_backend"]):
         out.append(detect_outliers_modified_zscore_column(g.copy(), "rmsle"))
     return pd.concat(out).reset_index(drop=True) if out else df
+
+
+def _apply_verified_labels(df: pd.DataFrame, model: str, budget: bool,
+                           result_dir: str) -> pd.DataFrame:
+    """Replace raw judge accuracy with fully resolved publication labels.
+
+    Fails closed when the verdict cache is absent, stale, or unresolved. This
+    prevents a point estimate conditional on only SymPy-checkable examples.
+    """
+    labels = load_verified_labels(model, budget, result_dir)
+    if labels is None:
+        raise SystemExit(
+            f"No verdict cache for {model}. Run `python analysis/diagnostics.py verdicts "
+            f"--model {model}{' --budget' if budget else ''}` first."
+        )
+    if not {"path", "file_sha256"}.issubset(df.columns):
+        raise SystemExit("The results CSV predates content-keyed scoring; rerun without --no-refresh.")
+    required = {"path", "file_sha256", "verified_success"}
+    if not required.issubset(labels.columns):
+        raise SystemExit("Verdict cache uses an obsolete schema; rerun diagnostics.py verdicts.")
+    lab = labels[["path", "file_sha256", "verified_success"]].copy()
+    lab = lab.rename(columns={"file_sha256": "verdict_sha256"})
+    lab["verified_success"] = lab["verified_success"].astype(str).str.lower().map(
+        {"true": True, "false": False, "1.0": True, "0.0": False,
+         "1": True, "0": False})
+    merged = df.merge(lab, on="path", how="left", validate="one_to_one")
+    stale = merged["verdict_sha256"].notna() & (
+        merged["file_sha256"].astype(str) != merged["verdict_sha256"].astype(str))
+    unresolved = merged["verified_success"].isna() | stale
+    if unresolved.any():
+        examples = merged.loc[unresolved, "path"].head(3).tolist()
+        raise SystemExit(
+            f"Publication scoring refused: {int(unresolved.sum())}/{len(merged)} displayed "
+            f"trials lack resolved symbolic labels. Adjudicate the unresolved CSV and rerun "
+            f"diagnostics.py verdicts --adjudications <file>. Examples: {examples}"
+        )
+    merged["original_judge_accuracy"] = merged["exact_accuracy"]
+    merged["exact_accuracy"] = merged["verified_success"].astype(float)
+    return merged.drop(columns=["verified_success", "verdict_sha256"])
 
 
 def _cell_grid(df: pd.DataFrame, title: str):
@@ -77,7 +116,7 @@ def _agents_ab(df: pd.DataFrame):
     backends = sorted(df["agent_backend"].unique())
     if len(backends) < 2:
         return
-    print("\n--- agent A/B (overall verified? no -- raw SA) ---")
+    print("\n--- agent A/B (same scoring mode as scoreboard header) ---")
     for b in backends:
         bdf = df[df["agent_backend"] == b]
         acc, std, _, _ = calculate_trial_stats(bdf)
@@ -86,7 +125,7 @@ def _agents_ab(df: pd.DataFrame):
               f"{bdf['total_tokens'].mean():,.0f} tok)")
 
 
-def _coverage(df: pd.DataFrame):
+def _coverage(df: pd.DataFrame, failures: pd.DataFrame = None):
     print("\n--- coverage (trials on disk per module x agent) ---")
     ct = df.pivot_table(index="module", columns="agent_backend", values="trial_id",
                         aggfunc="count", fill_value=0)
@@ -94,13 +133,19 @@ def _coverage(df: pd.DataFrame):
     missing = sorted(set(MODULE_ORDER) - set(df["module"].unique()))
     if missing:
         print(f"  modules with NO trials: {missing}")
+    if failures is not None and not failures.empty:
+        print("\n--- operational failures after runner retries (excluded from SA) ---")
+        failed = failures.groupby("agent_backend").size()
+        for agent in sorted(failed.index):
+            n_fail = int(failed.get(agent, 0))
+            print(f"  {agent:<22} {n_fail:>4} failure record(s) on disk")
 
 
 def _resource_quicklook(df: pd.DataFrame):
     d = df.dropna(subset=["total_tokens", "exact_accuracy"]).copy()
     if d.empty:
         return
-    print("\n--- SA% vs. total_tokens quartile (raw) ---")
+    print("\n--- SA% vs. total_tokens quartile ---")
     try:
         q = d["total_tokens"].quantile([0, .25, .5, .75, 1.0]).tolist()
         if len(set(q)) == 5:
@@ -156,7 +201,7 @@ def _budget_report(df: pd.DataFrame):
 
     dd = d.dropna(subset=["exact_accuracy"])
     if not dd.empty:
-        print("\n--- SA% vs. budget-spent quartile (raw) ---")
+        print("\n--- SA% vs. budget-spent quartile ---")
         try:
             q = dd["budget_spent"].quantile([0, .25, .5, .75, 1.0]).tolist()
             if len(set(q)) == 5:
@@ -170,34 +215,51 @@ def _budget_report(df: pd.DataFrame):
             pass
 
 
-def _verified_line(df: pd.DataFrame, model: str, budget: bool = False):
-    labels = load_verified_labels(model, budget)
+def _verified_line(df: pd.DataFrame, model: str, budget: bool = False,
+                   result_dir: str = None):
+    labels = load_verified_labels(model, budget, result_dir)
     if labels is None:
-        sfx = "_budget" if budget else ""
-        print(f"\n(no analysis/verdicts_{model}{sfx}.csv -- run `diagnostics.py verdicts --model {model}"
+        expected = Path(verdicts_csv_path(model, budget, result_dir)).name
+        print(f"\n(no analysis/{expected} -- run `diagnostics.py verdicts --model {model}"
               f"{' --budget' if budget else ''}` for the sympy-checked number; SA above is raw judge "
               f"accuracy and may be inflated)")
         return
 
-    lab = labels[["path", "verified_success", "raw_success"]]
+    needed = ["path", "verified_success", "raw_success"]
+    if "verification_resolved" in labels.columns:
+        needed.append("verification_resolved")
+    lab = labels[needed].copy()
     # Keep the verified stats consistent with the currently displayed df (e.g. subset_file filtering).
     shown = set(df["path"].astype(str)) if "path" in df.columns else None
     if shown is not None:
         lab = lab[lab["path"].astype(str).isin(shown)].reset_index(drop=True)
 
-    print(f"\n--- raw vs. verified SA (from verdicts_{model}{'_budget' if budget else ''}.csv, "
+    verdict_name = Path(verdicts_csv_path(model, budget, result_dir)).name
+    print(f"\n--- raw vs. verified SA (from {verdict_name}, "
           f"n={len(lab)}) ---")
     if lab.empty:
         print("  (no overlapping trials between verdicts CSV and the currently displayed rows)")
         return
-    print(f"  raw judge SA      : {100*lab['raw_success'].mean():.1f}%")
-    print(f"  sympy-verified SA : {100*lab['verified_success'].mean():.1f}%")
-    flipped = int((lab["raw_success"] != lab["verified_success"]).sum())
-    print(f"  {flipped} trials differ (judge-lenient credit / judge-strict misses)")
+    raw = lab["raw_success"].astype(str).str.lower().map(
+        {"true": True, "false": False, "1": True, "0": False}).fillna(False)
+    verified = lab["verified_success"].astype(str).str.lower().map(
+        {"true": True, "false": False, "1.0": True, "0.0": False,
+         "1": True, "0": False})
+    resolved = verified.notna()
+    n = len(lab)
+    successes = int(verified.fillna(False).sum())
+    unresolved = int((~resolved).sum())
+    print(f"  original judge SA : {100*raw.mean():.1f}%")
+    print(f"  resolved labels   : {int(resolved.sum())}/{n} ({100*resolved.mean():.1f}%)")
+    if resolved.any():
+        print(f"  SA among resolved : {100*verified[resolved].mean():.1f}%")
+    print(f"  all-trial SA range: {100*successes/n:.1f}-{100*(successes+unresolved)/n:.1f}%")
+    flipped = int((raw[resolved] != verified[resolved]).sum())
+    print(f"  {flipped} resolved trials differ from the original judge")
 
 def scoreboard(model: str, result_dir: str, subset_file: str, show_verified: bool, refresh: bool,
                budget: bool = False):
-    csv_path = results_by_trial_csv(budget)
+    csv_path = results_by_trial_csv(budget, result_dir)
     if refresh:
         update_results(model, result_dir, csv_path=csv_path)
     df = load_results_by_trial(model, csv_path=csv_path)
@@ -206,21 +268,27 @@ def scoreboard(model: str, result_dir: str, subset_file: str, show_verified: boo
     df = df.replace([np.inf, -np.inf], np.nan)
     if subset_file:
         df = filter_to_subset(df, subset_file)
+    if show_verified:
+        df = _apply_verified_labels(df, model, budget, result_dir)
     df = _clean(df)
+    failures = load_trial_failures(result_dir, model)
+    if subset_file and not failures.empty:
+        failures = filter_to_subset(failures, subset_file)
 
-    print(f"\n{'='*70}\nScoreboard: {model}   (n={len(df)} trials"
+    score_label = "RESOLVED SYMBOLIC" if show_verified else "PROVISIONAL ORIGINAL-JUDGE"
+    print(f"\n{'='*70}\nScoreboard: {model}   [{score_label}]   (n={len(df)} trials"
           + (", budgeted" if budget else "")
           + (f", subset={Path(subset_file).name}" if subset_file else "") + f")\n{'='*70}")
 
     _cell_grid(df, model)
     _per_module(df)
     _agents_ab(df)
-    _coverage(df)
+    _coverage(df, failures)
     _resource_quicklook(df)
     if budget:
         _budget_report(df)
     if show_verified:
-        _verified_line(df, model, budget)
+        _verified_line(df, model, budget, result_dir)
 
 
 def main():
@@ -237,7 +305,8 @@ def main():
                     help="Budget run JSON whose results_dir should be analysed; also enables --budget")
     ap.add_argument("--subset_file", default=None)
     ap.add_argument("--verified", action="store_true",
-                    help="also show the sympy-verified SA (needs diagnostics.py verdicts to have run)")
+                    help="publication mode: score with resolved symbolic/adjudicated labels and "
+                         "refuse output if any displayed trial remains unresolved")
     ap.add_argument("--no-refresh", action="store_true",
                     help="don't rescan trial JSONs, use results_by_trial.csv as-is")
     args = ap.parse_args()

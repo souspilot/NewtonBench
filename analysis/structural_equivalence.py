@@ -94,7 +94,16 @@ def _ast_to_sympy(node, symbol_map):
             symbol_map[node.id] = sp.Symbol(node.id, positive=True)
         return symbol_map[node.id]
     if isinstance(node, ast.Constant):
-        return sp.nsimplify(node.value) if isinstance(node.value, (int, float)) else node.value
+        if isinstance(node.value, bool):
+            return node.value
+        if isinstance(node.value, int):
+            return sp.Integer(node.value)
+        if isinstance(node.value, float):
+            # nsimplify's default tolerance rounds very small physical
+            # constants (e.g. 6.674e-55) to exactly zero, which makes the ratio
+            # checker accept/reject for the wrong reason.
+            return sp.Rational(str(node.value))
+        return node.value
     if isinstance(node, ast.Call):
         fname = node.func.id if isinstance(node.func, ast.Name) else getattr(node.func, "attr", None)
         if fname not in _MATH_FUNCS:
@@ -168,21 +177,48 @@ def submitted_law_to_sympy(submitted_law_src: str):
         raise NotCheckable("No function definition found")
     func_node = func_nodes[0]
     param_names = [a.arg for a in func_node.args.args]
-    return _eval_function_body(param_names, func_node.body)
+    expr, symbols = _eval_function_body(param_names, func_node.body)
+    # Preserve positional order: renamed parameters are semantically valid
+    # because the benchmark calls discovered_law positionally.
+    ordered_symbols = [next(s for s in symbols if str(s) == name) for name in param_names]
+    return expr, ordered_symbols
 
 
-def ground_truth_to_sympy(ground_truth_str: str, param_names):
+def ground_truth_to_sympy(ground_truth_str: str, parameter_symbols):
     """Parse a ground_truth_law expression string into a sympy expression,
     using the SAME parameter symbols as submitted_law_to_sympy. Any other name
     encountered (HIDDEN_CONSTANT, CONSTANT, k, ...) is auto-created as a free
     symbol via _ast_to_sympy's Name handling."""
-    symbol_map = {name: sp.Symbol(name, positive=True) for name in param_names}
+    if isinstance(parameter_symbols, dict):
+        symbol_map = dict(parameter_symbols)
+    else:
+        symbol_map = {name: sp.Symbol(name, positive=True) for name in parameter_symbols}
+    physical_symbols = set(symbol_map.values())
     tree = ast.parse(ground_truth_str, mode="eval")
     expr = _ast_to_sympy(tree.body, symbol_map)
-    return expr
+    constant_symbols = set(symbol_map.values()) - physical_symbols
+    return expr, constant_symbols
 
 
-def check_constant_equivalence(submitted_law_src: str, ground_truth_str: str):
+def _has_nonseparable_ground_truth_constant(gt_expr, physical_symbols, constant_symbols):
+    """Whether an unknown constant changes shape rather than output scale.
+
+    Ratio-based checking can prove equivalence only when each hidden constant
+    factors cleanly from the physical-variable dependence. Constants inside an
+    exponential, logarithm, additive offset, etc. need explicit adjudication.
+    """
+    for constant in constant_symbols:
+        without_constant = gt_expr.xreplace({constant: sp.Integer(1)})
+        if without_constant == 0:
+            return True
+        factor = sp.simplify(gt_expr / without_constant)
+        if factor.free_symbols & physical_symbols:
+            return True
+    return False
+
+
+def check_constant_equivalence(submitted_law_src: str, ground_truth_str: str,
+                               expected_param_names=None):
     """Returns one of: 'constant_equivalent', 'structurally_different', 'not_checkable'.
 
     'constant_equivalent' means submitted/ground_truth simplifies to something
@@ -193,14 +229,37 @@ def check_constant_equivalence(submitted_law_src: str, ground_truth_str: str):
     symbols in the ratio and correctly return 'structurally_different'.
     """
     try:
-        sub_expr, sub_params = submitted_law_to_sympy(submitted_law_src)
-        gt_expr = ground_truth_to_sympy(ground_truth_str, [str(p) for p in sub_params])
+        sub_expr, sub_params_ordered = submitted_law_to_sympy(submitted_law_src)
+        sub_params = set(sub_params_ordered)
+        if expected_param_names is not None:
+            if len(expected_param_names) != len(sub_params_ordered):
+                return "structurally_different"
+            parameter_symbols = dict(zip(expected_param_names, sub_params_ordered))
+        else:
+            parameter_symbols = {str(p): p for p in sub_params_ordered}
+        gt_expr, gt_constants = ground_truth_to_sympy(ground_truth_str, parameter_symbols)
+
+        # An identically-zero submission otherwise produces ratio 0, whose lack
+        # of free symbols would be a false equivalence for every law.
+        if sp.simplify(sub_expr) == 0 or sp.simplify(gt_expr) == 0:
+            return "structurally_different"
+
+        sub_dependencies = sub_expr.free_symbols & sub_params
+        gt_dependencies = gt_expr.free_symbols & sub_params
+        if sub_dependencies != gt_dependencies:
+            # Missing or extra physical-variable dependence is a proof of
+            # mismatch even when a hidden constant is non-separable.
+            return "structurally_different"
 
         ratio = sp.simplify(sub_expr / gt_expr)
+        if ratio.has(sp.zoo, sp.oo, -sp.oo, sp.nan):
+            return "structurally_different"
         remaining_physical = ratio.free_symbols & sub_params
 
         if not remaining_physical:
             return "constant_equivalent"
+        if _has_nonseparable_ground_truth_constant(gt_expr, sub_params, gt_constants):
+            return "not_checkable"
         return "structurally_different"
     except NotCheckable:
         return "not_checkable"

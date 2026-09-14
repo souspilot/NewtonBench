@@ -50,7 +50,7 @@ def _run_linear_coulomb_experiment(
 
     decay_rate_q1 = 10.0
     decay_rate_q2 = 5.0
-    
+
     num_steps = int(duration / time_step)
     if num_steps <= 0:
         return {'time': [], 'position': [], 'velocity': []}
@@ -227,7 +227,7 @@ def evaluate_law(
     param_description: str,
     difficulty: str = 'easy',
     law_version: str = None,
-    judge_model_name: str = "nemotron-ultra",
+    judge_model_name: str = None,
     trial_info=None,
 ) -> dict:
     """
@@ -278,4 +278,3 @@ def evaluate_law(
         trial_info=trial_info,
         symbolic_check=True
     )
-    

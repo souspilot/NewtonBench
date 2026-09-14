@@ -146,7 +146,9 @@ def add_necessary_imports(function_str: str) -> str:
     
     return function_str
 
-def llm_symbolic_equivalence_judge(llm_formula_str: str, gt_formula_str: str, param_description: str, judge_model_name: str = "nemotron-ultra", trial_info=None) -> bool:
+def llm_symbolic_equivalence_judge(llm_formula_str: str, gt_formula_str: str,
+                                   param_description: str, judge_model_name: str,
+                                   trial_info=None) -> bool:
     """
     Use LLM to determine if two formulas are mathematically equivalent.
     Allows up to 3 retries if there is any error or if the answer cannot be matched.
@@ -173,7 +175,12 @@ def llm_symbolic_equivalence_judge(llm_formula_str: str, gt_formula_str: str, pa
 
             messages = [{"role": "system", 'content': "detailed thinking on"}] if "nemotron" in judge_model_name else []
             messages.append({"role": "user", "content": prompt})
-            response, reasoning_response, _ = call_llm_api(messages, model_name=judge_model_name, temperature=0.6, trial_info=trial_info)
+            # Judging is a measurement, not a creative generation task. Keep it
+            # deterministic; independent adjudication is used only when the
+            # symbolic checker returns unresolved.
+            response, reasoning_response, _ = call_llm_api(
+                messages, model_name=judge_model_name, temperature=0.0,
+                trial_info=trial_info)
             
             if response is None:
                 print(f"[LLM Judge] Attempt {attempt}: No response received. Retrying...")
@@ -208,7 +215,7 @@ def evaluate_law(
     test_data: Dict[str, np.ndarray],
     parameter_mapping: Dict[str, str],
     param_description: str,
-    judge_model_name: str = "nemotron-ultra",
+    judge_model_name: str = None,
     trial_info: Any = None,
     symbolic_check: bool = True
 ) -> dict:
@@ -260,6 +267,8 @@ def evaluate_law(
         
     try:
         if symbolic_check:
+            if not judge_model_name:
+                raise ValueError("symbolic_check=True requires an explicit judge_model_name")
             # Create default trial_info if none provided
             if trial_info is None:
                 trial_info = {'trial_id': 'llm_judge'}
@@ -282,4 +291,4 @@ def evaluate_law(
         "symbolic_equivalent": symbolic_equivalent,
         "symbolic_msg": symbolic_msg,
         "error": error_msg
-    } 
+    }
