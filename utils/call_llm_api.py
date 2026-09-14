@@ -58,6 +58,7 @@ api_source_mapping = {
     "sr-scientist": {"oa": "sr-scientist"},
     "intern-s2": {"oa": "intern-s2"},
     "muse-glimmer-30b": {"oa": "muse-glimmer-30b"},
+    "gemma4-31b": {"oa": "gemma4-31b"},
 
     "dsv3": {"or": "deepseek/deepseek-chat-v3-0324"}, #formal-LLM
     "dsr1": {"or": "deepseek/deepseek-r1-0528"}, #formal-LRM
