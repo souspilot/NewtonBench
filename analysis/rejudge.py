@@ -107,6 +107,8 @@ def main():
                         help="default: evaluation_results, or the budgeted tree when --budget is set")
     parser.add_argument("--budget", action="store_true",
                         help="re-judge a budgeted run (read/write under the budget results tree)")
+    parser.add_argument("--budget-config", default=None,
+                        help="Budget run JSON whose results_dir should be re-judged; also enables --budget")
     parser.add_argument("--module", default=None, help="Restrict to one module")
     parser.add_argument("--agent", default=None, help="Restrict to one agent backend")
     parser.add_argument("--dry-run", action="store_true", help="Just count trials, don't re-judge")
@@ -115,14 +117,17 @@ def main():
     parser.add_argument("--output-suffix", default=None,
                         help="Suffix for output dir (default: judge model name)")
     args = parser.parse_args()
+    args.budget = args.budget or bool(args.budget_config)
 
     if args.base_dir is None:
         if args.budget:
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
             try:
                 from utils.budget import load_budget_config
-                args.base_dir = load_budget_config().results_dir
+                args.base_dir = load_budget_config(args.budget_config).results_dir
             except Exception:
+                if args.budget_config:
+                    raise
                 args.base_dir = "budget_evaluation_results"
         else:
             args.base_dir = "evaluation_results"

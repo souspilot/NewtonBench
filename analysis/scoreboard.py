@@ -233,6 +233,8 @@ def main():
     ap.add_argument("--budget", action="store_true",
                     help="score a budgeted run: read from the budget results tree, use a separate "
                          "results_by_trial CSV, and print the grant-economics section")
+    ap.add_argument("--budget-config", default=None,
+                    help="Budget run JSON whose results_dir should be analysed; also enables --budget")
     ap.add_argument("--subset_file", default=None)
     ap.add_argument("--verified", action="store_true",
                     help="also show the sympy-verified SA (needs diagnostics.py verdicts to have run)")
@@ -249,7 +251,8 @@ def main():
     else:
         raise SystemExit("pass --model <name> or --all")
 
-    result_dir = resolve_result_dir(args.result_dir, args.budget)
+    args.budget = args.budget or bool(args.budget_config)
+    result_dir = resolve_result_dir(args.result_dir, args.budget, args.budget_config)
     for m in models:
         scoreboard(m, result_dir, args.subset_file, args.verified, not args.no_refresh, args.budget)
 

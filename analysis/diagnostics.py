@@ -624,6 +624,8 @@ def main():
         p.add_argument("--budget", action="store_true",
                        help="analyse a budgeted run: read the budget results tree, use a separate "
                             "verdicts_<model>_budget.csv, and add a budget-vs-outcome block to `trace`")
+        p.add_argument("--budget-config", default=None,
+                       help="Budget run JSON whose results_dir should be analysed; also enables --budget")
         p.add_argument("--subset_file", default=None,
                        help="representative_subset.json -- pin analysis to one cell set.")
         p.add_argument("--agent", choices=["vanilla_agent", "code_assisted_agent", "planned_agent"],
@@ -643,7 +645,8 @@ def main():
         args.samples = 8
     if not hasattr(args, "max_examples"):
         args.max_examples = 15
-    args.result_dir = resolve_result_dir(args.result_dir, args.budget)
+    args.budget = args.budget or bool(args.budget_config)
+    args.result_dir = resolve_result_dir(args.result_dir, args.budget, args.budget_config)
 
     steps = {"verdicts": cmd_verdicts, "mistakes": cmd_mistakes,
              "trace": cmd_trace, "agents": cmd_agents}

@@ -19,6 +19,21 @@ python run_master.py --models qwen38-27b --budget
 Or set `NEWTONBENCH_BUDGET=1` in the environment. Without the flag the benchmark
 behaves exactly as before.
 
+For named runs, copy `budget.json`, set a unique `results_dir`, and pass that file
+to both the runner and analysis command. The config option enables budget mode,
+so directory renaming is unnecessary:
+
+```bash
+cp configs/budget/budget.json configs/budget/budget_800_cap.json
+# edit results_dir to "budget_evaluation_results_800_cap" and the desired costs
+python run_master.py --model_name qwen38-27b --budget-config configs/budget/budget_800_cap.json
+python analysis/scoreboard.py --model qwen38-27b --budget-config configs/budget/budget_800_cap.json
+python analysis/diagnostics.py trace --model qwen38-27b --budget-config configs/budget/budget_800_cap.json
+```
+
+The same selection can be exported once as `NEWTONBENCH_BUDGET_CONFIG`; child
+runner processes inherit it automatically.
+
 Budgeted results are written to a **separate** directory tree (default
 `budget_evaluation_results/`, set by `results_dir` below) so they never mix with
 the standard `evaluation_results/`. The analysis scripts take a matching

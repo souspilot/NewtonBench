@@ -91,7 +91,7 @@ def analysis_path(name: str) -> str:
     return str(ANALYSIS_DIR / name)
 
 
-def budget_result_dir() -> str:
+def budget_result_dir(config_path: Optional[str] = None) -> str:
     """Directory tree budgeted runs write to (configs/budget/budget.json -> results_dir);
     falls back to the documented default if the config can't be read."""
     try:
@@ -99,16 +99,19 @@ def budget_result_dir() -> str:
         if str(REPO_ROOT) not in _sys.path:
             _sys.path.insert(0, str(REPO_ROOT))
         from utils.budget import load_budget_config
-        return load_budget_config().results_dir
+        return load_budget_config(config_path).results_dir
     except Exception:
+        if config_path:
+            raise
         return "budget_evaluation_results"
 
 
-def resolve_result_dir(result_dir: Optional[str], budget: bool) -> str:
+def resolve_result_dir(result_dir: Optional[str], budget: bool,
+                       budget_config: Optional[str] = None) -> str:
     """`--result_dir` wins if given; otherwise pick the tree for the mode."""
     if result_dir:
         return result_dir
-    return budget_result_dir() if budget else "evaluation_results"
+    return budget_result_dir(budget_config) if (budget or budget_config) else "evaluation_results"
 
 
 def results_by_trial_csv(budget: bool) -> str:
@@ -408,6 +411,12 @@ def update_results(model_name: str, result_dir: str, csv_path: str = RESULTS_BY_
         for c in base_cols:  # keep older CSVs forward-compatible
             if c not in df.columns:
                 df[c] = np.nan
+        # A model may be evaluated under several named run configs. Refresh means
+        # "rebuild this model from result_dir", not "merge with whichever run was
+        # analysed previously"; otherwise equal logical trial keys overwrite while
+        # missing keys from the old run linger in the scoreboard.
+        if "model_name" in df.columns:
+            df = df[df["model_name"] != model_name].copy()
     else:
         df = pd.DataFrame(columns=base_cols)
 

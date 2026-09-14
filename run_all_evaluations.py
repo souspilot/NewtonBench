@@ -286,10 +286,15 @@ def main():
                       help="Enable budgeted 'principal investigator' mode (see configs/budget/README.md). "
                            "Costs come from configs/budget/budget.json; results go to a separate directory "
                            "tree (default budget_evaluation_results/). Also settable via NEWTONBENCH_BUDGET=1.")
+    parser.add_argument("--budget-config", default=None,
+                      help="Budget run JSON to use. Supplying it enables budget mode and uses its results_dir.")
 
     args = parser.parse_args()
-    budget_mode = is_budget_enabled(args.budget)
-    results_root = load_budget_config().results_dir if budget_mode else "evaluation_results"
+    if args.budget_config:
+        os.environ["NEWTONBENCH_BUDGET_CONFIG"] = args.budget_config
+    budget_mode = is_budget_enabled(args.budget or bool(args.budget_config))
+    budget_config = load_budget_config(args.budget_config) if budget_mode else None
+    results_root = budget_config.results_dir if budget_config else "evaluation_results"
     if budget_mode:
         print(f"Budgeted mode ON -- reading/writing under '{results_root}/'.")
 
@@ -518,6 +523,8 @@ def main():
         ]
         if budget_mode:
             command.append("--budget")
+        if args.budget_config:
+            command.extend(["--budget-config", args.budget_config])
         # --force_rerun should produce fresh trials even for already-complete
         # configs, so bypass run_experiments.py's top-up cap.
         if args.force_rerun:

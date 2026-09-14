@@ -535,7 +535,11 @@ if __name__ == "__main__":
                            "<experiment_output> reports funds remaining. Costs are set in configs/budget/budget.json. "
                            "Results are written to a separate directory tree (default budget_evaluation_results/). "
                            "Can also be enabled with NEWTONBENCH_BUDGET=1.")
+    parser.add_argument("--budget-config", default=None,
+                      help="Budget run JSON to use. Supplying it enables budget mode and uses its results_dir.")
     cli_args = parser.parse_args()
+    if cli_args.budget_config:
+        os.environ["NEWTONBENCH_BUDGET_CONFIG"] = cli_args.budget_config
 
     # --- Pre-flight Check ---
     try:

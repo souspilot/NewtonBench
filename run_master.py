@@ -76,6 +76,7 @@ def build_commands(
     subset_file: str = "",
     trials_per_law: int = 0,
     budget: bool = False,
+    budget_config: str = "",
 ) -> List[List[str]]:
     run_all = repo_root / "run_all_evaluations.py"
     if not run_all.exists():
@@ -103,6 +104,8 @@ def build_commands(
                     cmd.extend(["--trials_per_law", str(trials_per_law)])
                 if budget:
                     cmd.append("--budget")
+                if budget_config:
+                    cmd.extend(["--budget-config", budget_config])
                 commands.append(cmd)
     return commands
 
@@ -256,6 +259,10 @@ def main():
         help="Enable budgeted 'principal investigator' mode for every run (passes --budget through to "
              "run_all_evaluations.py). See configs/budget/README.md.",
     )
+    parser.add_argument(
+        "--budget-config", default="",
+        help="Budget run JSON to use. Supplying it enables budget mode and uses its results_dir.",
+    )
 
     args = parser.parse_args()
 
@@ -274,7 +281,7 @@ def main():
     commands = build_commands(
         repo_root, modules, models,
         full=args.full, subset_file=args.subset_file, trials_per_law=args.trials_per_law,
-        budget=args.budget,
+        budget=args.budget or bool(args.budget_config), budget_config=args.budget_config,
     )
 
     # Always show the commands before running

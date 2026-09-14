@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 _DEFAULT_CONFIG_PATH = os.path.join("configs", "budget", "budget.json")
+_CONFIG_ENV = "NEWTONBENCH_BUDGET_CONFIG"
 
 _BUILTIN_DEFAULTS: Dict[str, Any] = {
     "results_dir": "budget_evaluation_results",
@@ -56,13 +57,14 @@ _BUILTIN_DEFAULTS: Dict[str, Any] = {
 
 
 def load_budget_config(path: Optional[str] = None) -> "BudgetConfig":
-    """Convenience wrapper around BudgetConfig.load()."""
-    return BudgetConfig.load(path)
+    """Load an explicit config, the config named by the environment, or the default."""
+    selected = path or os.environ.get(_CONFIG_ENV) or None
+    return BudgetConfig.load(selected, strict=bool(selected))
 
 
 def is_budget_enabled(cli_flag: bool = False) -> bool:
-    """Budget mode is on if --budget was passed or NEWTONBENCH_BUDGET is truthy."""
-    if cli_flag:
+    """Budget mode is on via a flag, an explicit config, or NEWTONBENCH_BUDGET."""
+    if cli_flag or os.environ.get(_CONFIG_ENV, "").strip():
         return True
     return os.environ.get("NEWTONBENCH_BUDGET", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -89,7 +91,7 @@ class BudgetConfig:
         self._modules: Dict[str, Any] = raw.get("modules", {})
 
     @classmethod
-    def load(cls, path: Optional[str] = None) -> "BudgetConfig":
+    def load(cls, path: Optional[str] = None, strict: bool = False) -> "BudgetConfig":
         path = path or _DEFAULT_CONFIG_PATH
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -97,6 +99,8 @@ class BudgetConfig:
             raw = _deep_merge(_BUILTIN_DEFAULTS, raw)
             return cls(raw, source=path)
         except (FileNotFoundError, json.JSONDecodeError) as e:
+            if strict:
+                raise ValueError(f"Could not read budget config {path}: {e}") from e
             print(f"[budget] WARNING: could not read {path} ({e}); using built-in default cost model.")
             return cls(copy.deepcopy(_BUILTIN_DEFAULTS), source="<builtin>")
 
