@@ -1,0 +1,43 @@
+{
+  "_comment": "Cost model for budgeted 'principal-investigator' runs (run_experiments.py --budget). Everything here is data only: no prompt text or experiment code lives in this file. Edit the numbers freely. 'defaults' applies to every module; anything under 'modules.<name>' is deep-merged on top of it for that module. See configs/budget/README.md.",
+
+  "results_dir": "budget_evaluation_results_600_cap",
+  "currency": "$",
+
+  "defaults": {
+    "starting_funds": 600.0,
+    "cost_model": {
+      "request_fee_per_param": 30.0,
+      "per_datapoint_cost": 15.0,
+      "batch_tiers": [
+        [5,  1.0],
+        [10, 2.0],
+        [15, 3.5],
+        [20, 6.0]
+      ],
+      "default_precision": 1,
+      "precision_multipliers": {
+        "1": 1.0,
+        "2": 1.6,
+        "3": 2.5,
+        "4": 4.0,
+        "5": 6.5
+      },
+      "precision_sig_figs": {
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 6
+      },
+      "magnitude_surcharge": {
+        "reference_low": 1e-3,
+        "reference_high": 1e3,
+        "fraction_per_decade_outside": 0.15
+      }
+    },
+    "notes": ""
+  },
+
+  "modules": {}
+}
