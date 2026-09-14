@@ -29,7 +29,6 @@ import importlib
 import json
 import os
 import sys
-import glob
 import numpy as np
 import traceback
 from pathlib import Path
@@ -40,6 +39,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+from newton_common import filter_to_subset, load_trial_failures, load_trials  # noqa: E402
 
 
 def load_module(module_name: str):
@@ -119,6 +120,9 @@ def main():
                         help="Budget run JSON whose results_dir should be re-judged; also enables --budget")
     parser.add_argument("--module", default=None, help="Restrict to one module")
     parser.add_argument("--agent", default=None, help="Restrict to one agent backend")
+    parser.add_argument("--subset-file", default=None,
+                        help="representative-subset JSON; applies the same trial selection, "
+                             "rerun deduplication, and four-trial cap as diagnostics/scoreboard")
     parser.add_argument("--dry-run", action="store_true", help="Just count trials, don't re-judge")
     parser.add_argument("--in-place", action="store_true",
                         help="Overwrite original trial JSONs. Default: write to a parallel directory.")
@@ -164,26 +168,27 @@ def main():
     output_model_name = f"{args.model}_judged_by_{suffix}"
     output_base = Path(args.base_dir) / output_model_name
 
-    # Find all trial JSON files, split into ones that need re-judging vs. failed
-    # trials that should still count toward the aggregate but don't need an API
-    # call (their submitted_law stub, "return float('nan')", can never be
-    # symbolically equivalent to anything -- re-judging would just re-confirm
-    # exact_accuracy == 0.0 at the cost of a wasted judge call).
-    trial_files = []
-    fail_files = []
-    for trial_path in sorted(model_dir.rglob("trial*.json")):
-        if "_chat_history" in trial_path.name:
-            continue
-        # Filter by module if specified
-        if args.module and args.module not in str(trial_path):
-            continue
-        # Filter by agent if specified
-        if args.agent and args.agent not in str(trial_path):
-            continue
-        if trial_path.name.endswith("_fail.json"):
-            fail_files.append(trial_path)
-        else:
-            trial_files.append(trial_path)
+    # Select exactly the same completed scientific trials that diagnostics and
+    # scoreboard will consume: completed-over-failure preference, latest rerun,
+    # and at most four trials per full task configuration. Infrastructure
+    # failures are retained separately for operational reporting.
+    completed = filter_to_subset(
+        load_trials(args.base_dir, args.model, include_fails=False),
+        args.subset_file,
+    )
+    failures = filter_to_subset(
+        load_trial_failures(args.base_dir, args.model),
+        args.subset_file,
+    )
+    if args.module:
+        completed = completed[completed["module"] == args.module]
+        failures = failures[failures["module"] == args.module]
+    if args.agent:
+        completed = completed[completed["agent_backend"] == args.agent]
+        failures = failures[failures["agent_backend"] == args.agent]
+
+    trial_files = sorted((Path(p) for p in completed["path"]), key=lambda p: str(p.relative_to(model_dir)))
+    fail_files = sorted((Path(p) for p in failures["path"]), key=lambda p: str(p.relative_to(model_dir)))
 
     print(f"Found {len(trial_files)} completed trial files to re-judge "
           f"(+ {len(fail_files)} operational failure files copied separately, not scored)")
@@ -194,6 +199,8 @@ def main():
         print(f"  Module filter: {args.module}")
     if args.agent:
         print(f"  Agent filter: {args.agent}")
+    if args.subset_file:
+        print(f"  Subset: {args.subset_file}")
 
     if args.dry_run:
         # Count by module/agent
