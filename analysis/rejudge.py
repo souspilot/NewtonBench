@@ -34,6 +34,13 @@ import numpy as np
 import traceback
 from pathlib import Path
 
+# Executing ``python analysis/rejudge.py`` makes ``analysis/`` Python's import
+# root, not necessarily the repository root.  Make imports such as
+# ``modules.m8_sound_speed`` independent of the caller's PYTHONPATH/cwd.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 def load_module(module_name: str):
     """Import a NewtonBench physics module."""
@@ -138,7 +145,6 @@ def main():
 
     if args.base_dir is None:
         if args.budget:
-            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
             try:
                 from utils.budget import load_budget_config
                 args.base_dir = load_budget_config(args.budget_config).results_dir
