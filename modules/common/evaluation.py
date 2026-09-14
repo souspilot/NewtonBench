@@ -206,8 +206,9 @@ def llm_symbolic_equivalence_judge(llm_formula_str: str, gt_formula_str: str,
         except Exception as e:
             print(f"[LLM Judge] Attempt {attempt}: Exception occurred: {e}. Retrying...")
             continue
-    print(f"[LLM Judge] All {max_retries} attempts failed. Returning False.")
-    return False
+    raise RuntimeError(
+        f"LLM judge produced no parseable Answer: YES/NO after {max_retries} attempts"
+    )
 
 def evaluate_law(
     llm_function_str: str,

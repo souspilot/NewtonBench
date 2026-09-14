@@ -190,6 +190,32 @@ class SymbolicVerdictTests(unittest.TestCase):
         self.assertEqual(adjudicated.loc[2, "verification_source"],
                          "adjudication:local-judge-plus-human")
 
+        independently_judged = rows.assign(
+            judge_model="gemma4-31b",
+            evaluated_model="muse-glimmer-30b",
+        )
+        fallback = compute_verdicts(
+            independently_judged,
+            rmsle_threshold=1e-3,
+            independent_judge="gemma4-31b",
+        )
+        self.assertTrue(fallback.loc[2, "verified_success"])
+        self.assertEqual(
+            fallback.loc[2, "verification_source"],
+            "independent_judge:gemma4-31b",
+        )
+        # Decisive deterministic results remain primary even when the judge
+        # disagrees with them.
+        self.assertTrue(fallback.loc[0, "verified_success"])
+        self.assertFalse(fallback.loc[1, "verified_success"])
+
+        with self.assertRaises(SystemExit):
+            compute_verdicts(
+                independently_judged.assign(evaluated_model="gemma4-31b"),
+                rmsle_threshold=1e-3,
+                independent_judge="gemma4-31b",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

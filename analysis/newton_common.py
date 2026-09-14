@@ -229,6 +229,8 @@ def load_trials(result_dir: str, model: str, include_fails: bool = False,
                 trial_id=trial_id,
                 module=data.get("module_name"),
                 model_name=data.get("model_name", model),
+                evaluated_model=data.get("evaluated_model", data.get("model_name", model)),
+                judge_model=data.get("LLM judge"),
                 noise_level=data.get("noise_level"),
                 equation_difficulty=data.get("equation_difficulty"),
                 model_system=data.get("model_system"),
@@ -444,13 +446,14 @@ def load_adjudications(path: Optional[str]) -> Optional[pd.DataFrame]:
 
 def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
                      sympy_timeout: float = DEFAULT_SYMPY_TIMEOUT,
-                     adjudications: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                     adjudications: Optional[pd.DataFrame] = None,
+                     independent_judge: Optional[str] = None) -> pd.DataFrame:
     """Add judge_verdict / rmsle_verdict / structural_verdict / agreement_bucket.
 
     The deterministic structural result is the primary label whenever it can
-    decide. ``not_checkable`` remains unresolved: RMSLE and the original judge
-    are diagnostics, never silent substitutes for symbolic equivalence. An
-    explicit adjudications table may resolve any row and records its source.
+    decide. ``not_checkable`` remains unresolved unless the caller explicitly
+    names the independent judge stored in the trial tree. An explicit
+    adjudications table may resolve any row and records its source.
 
     The structural check is run once per UNIQUE (submitted_law, ground_truth_law)
     pair (trials re-run the same config, so pairs repeat a lot) and each call is
@@ -504,6 +507,33 @@ def compute_verdicts(df: pd.DataFrame, rmsle_threshold: float,
     verified.loc[passed] = True
     verified.loc[failed] = False
     source.loc[passed | failed] = "deterministic_symbolic"
+
+    if independent_judge:
+        if "judge_model" not in df.columns:
+            raise SystemExit("Independent-judge fallback requested, but trial rows do not record a judge model.")
+        observed = df["judge_model"].dropna().astype(str)
+        mismatched = observed.ne(independent_judge)
+        missing = df["judge_model"].isna()
+        if missing.any() or mismatched.any():
+            found = sorted(observed.unique().tolist())
+            raise SystemExit(
+                f"Independent-judge fallback refused: expected every row to be judged by "
+                f"{independent_judge!r}, found {found} and {int(missing.sum())} missing value(s)."
+            )
+        if "evaluated_model" not in df.columns or df["evaluated_model"].isna().any():
+            raise SystemExit(
+                "Independent-judge fallback requested, but one or more rows do not identify "
+                "the evaluated model."
+            )
+        self_judged = df["evaluated_model"].astype(str).eq(independent_judge)
+        if self_judged.any():
+            raise SystemExit(
+                f"Independent-judge fallback refused: {int(self_judged.sum())} row(s) were "
+                f"evaluated by the same model, {independent_judge!r}."
+            )
+        unresolved = verified.isna()
+        verified.loc[unresolved] = df.loc[unresolved, "judge_verdict"].astype(bool).to_numpy()
+        source.loc[unresolved] = f"independent_judge:{independent_judge}"
 
     if adjudications is not None and not adjudications.empty:
         cols = ["path", "adjudicated_success", "adjudicator"]

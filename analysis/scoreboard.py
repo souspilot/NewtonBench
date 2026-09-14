@@ -6,7 +6,7 @@ module, and by agent, plus coverage and a resource quick-look.
 No sympy, no transcript parsing. For "where is the model going wrong",
 "is that 90% judge-inflated", mistake taxonomy, etc. -> diagnostics.py.
 
-Raw exact-accuracy is provisional original-judge scoring. For publication,
+Raw exact-accuracy is provisional stored-judge scoring. For publication,
 run `diagnostics.py verdicts --model X`, explicitly adjudicate every unresolved
 row, then pass --verified. Publication mode fails closed if any label is absent.
 
@@ -249,13 +249,13 @@ def _verified_line(df: pd.DataFrame, model: str, budget: bool = False,
     n = len(lab)
     successes = int(verified.fillna(False).sum())
     unresolved = int((~resolved).sum())
-    print(f"  original judge SA : {100*raw.mean():.1f}%")
+    print(f"  stored judge SA   : {100*raw.mean():.1f}%")
     print(f"  resolved labels   : {int(resolved.sum())}/{n} ({100*resolved.mean():.1f}%)")
     if resolved.any():
         print(f"  SA among resolved : {100*verified[resolved].mean():.1f}%")
     print(f"  all-trial SA range: {100*successes/n:.1f}-{100*(successes+unresolved)/n:.1f}%")
     flipped = int((raw[resolved] != verified[resolved]).sum())
-    print(f"  {flipped} resolved trials differ from the original judge")
+    print(f"  {flipped} resolved trials differ from the stored judge")
 
 def scoreboard(model: str, result_dir: str, subset_file: str, show_verified: bool, refresh: bool,
                budget: bool = False):
@@ -275,7 +275,7 @@ def scoreboard(model: str, result_dir: str, subset_file: str, show_verified: boo
     if subset_file and not failures.empty:
         failures = filter_to_subset(failures, subset_file)
 
-    score_label = "RESOLVED SYMBOLIC" if show_verified else "PROVISIONAL ORIGINAL-JUDGE"
+    score_label = "VERIFIED CASCADE" if show_verified else "PROVISIONAL STORED-JUDGE"
     print(f"\n{'='*70}\nScoreboard: {model}   [{score_label}]   (n={len(df)} trials"
           + (", budgeted" if budget else "")
           + (f", subset={Path(subset_file).name}" if subset_file else "") + f")\n{'='*70}")

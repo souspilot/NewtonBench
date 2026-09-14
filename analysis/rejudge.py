@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
@@ -68,6 +69,10 @@ def rejudge_trial(
         trial_info={"trial_id": trial_data.get("trial_id", 0)},
     )
 
+    symbolic_msg = str(new_eval.get("symbolic_msg") or "")
+    if symbolic_msg.startswith("Symbolic equivalence check failed:"):
+        raise RuntimeError(symbolic_msg)
+
     return new_eval
 
 
@@ -110,19 +115,26 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Just count trials, don't re-judge")
     parser.add_argument("--in-place", action="store_true",
                         help="Overwrite original trial JSONs. Default: write to a parallel directory.")
+    parser.add_argument("--resume", action="store_true",
+                        help="reuse an existing parallel output only when its judge and source-file "
+                             "hash match; useful after an interrupted run")
     parser.add_argument("--output-suffix", default=None,
                         help="Suffix for output dir (default: judge model name)")
-    parser.add_argument("--judge-max-tokens", type=int, default=2048,
-                        help="maximum completion tokens for each judge call (default: 2048)")
+    parser.add_argument("--judge-max-tokens", type=int, default=None,
+                        help="optional maximum completion tokens for each judge call "
+                             "(default: no explicit cap)")
     args = parser.parse_args()
     args.budget = args.budget or bool(args.budget_config)
     if args.judge == args.model and not args.allow_self_judge:
         raise SystemExit("Refusing self-judging. Choose an independent local judge, or pass "
                          "--allow-self-judge for a diagnostic-only run.")
-    if args.judge_max_tokens <= 0:
+    if args.resume and args.in_place:
+        raise SystemExit("--resume cannot be combined with --in-place")
+    if args.judge_max_tokens is not None and args.judge_max_tokens <= 0:
         raise SystemExit("--judge-max-tokens must be positive")
-    # Module imports happen lazily below, so the API helper will see this cap.
-    os.environ["LLM_MAX_TOKENS"] = str(args.judge_max_tokens)
+    if args.judge_max_tokens is not None:
+        # Module imports happen lazily below, so the API helper will see this cap.
+        os.environ["LLM_MAX_TOKENS"] = str(args.judge_max_tokens)
 
     if args.base_dir is None:
         if args.budget:
@@ -209,8 +221,24 @@ def main():
         print(f"  [{i+1}/{len(trial_files)}] {rel} ... ", end="", flush=True)
 
         try:
-            with open(trial_path) as f:
-                trial_data = json.load(f)
+            source_bytes = trial_path.read_bytes()
+            source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+            trial_data = json.loads(source_bytes)
+
+            out_path = trial_path if args.in_place else output_base / rel
+            if args.resume and out_path.exists():
+                try:
+                    existing = json.loads(out_path.read_bytes())
+                except Exception:  # malformed partial output must be regenerated
+                    existing = None
+                if (existing is not None
+                        and existing.get("LLM judge") == args.judge
+                        and existing.get("rejudge_source_sha256") == source_sha256):
+                    config_key = str(config_dir)
+                    config_trials.setdefault(config_key, []).append(existing)
+                    success += 1
+                    print("RESUMED")
+                    continue
 
             old_acc = trial_data.get("evaluation", {}).get("exact_accuracy", 0.0)
 
@@ -234,12 +262,10 @@ def main():
                 # filtering every row back out as the original model.
                 trial_data["evaluated_model"] = trial_data.get("model_name", args.model)
                 trial_data["model_name"] = output_model_name
+                trial_data["rejudge_source_sha256"] = source_sha256
 
             # Write output
-            if args.in_place:
-                out_path = trial_path
-            else:
-                out_path = output_base / rel
+            if not args.in_place:
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(out_path, "w") as f:

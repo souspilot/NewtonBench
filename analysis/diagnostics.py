@@ -53,7 +53,8 @@ from newton_common import (  # noqa: E402
 # ===========================================================================
 
 VERDICT_COLS = ["path", "file_sha256", "module", "equation_difficulty", "model_system", "law_version",
-                "agent_backend", "trial_id", "is_fail", "status", "rounds", "num_experiments",
+                "agent_backend", "trial_id", "evaluated_model", "judge_model", "is_fail", "status",
+                "rounds", "num_experiments",
                 "total_tokens", "rmsle", "exact_accuracy", "judge_verdict", "rmsle_verdict",
                 "structural_verdict", "agreement_bucket", "raw_success", "verified_success",
                 "verification_source", "verification_resolved", "adjudicated_success",
@@ -87,7 +88,8 @@ def compute_and_write_verdicts(args) -> pd.DataFrame:
     adjudications = load_adjudications(getattr(args, "adjudications", None))
     df = compute_verdicts(_load_filtered(args, include_fails=False),
                           args.rmsle_threshold, getattr(args, "sympy_timeout", DEFAULT_SYMPY_TIMEOUT),
-                          adjudications=adjudications)
+                          adjudications=adjudications,
+                          independent_judge=getattr(args, "independent_judge", None))
     out = verdicts_csv_path(args.model, args.budget, args.result_dir)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df[[c for c in VERDICT_COLS if c in df.columns]].to_csv(out, index=False)
@@ -99,7 +101,7 @@ def verdict_frame(args) -> pd.DataFrame:
     if it exists and still covers every filtered trial, else run (and cache) the
     sympy pass. Avoids paying for structural checks 3x in `all`."""
     cached = load_verified_labels(args.model, args.budget, args.result_dir)
-    if getattr(args, "adjudications", None):
+    if getattr(args, "adjudications", None) or getattr(args, "independent_judge", None):
         return compute_and_write_verdicts(args)
     if cached is not None:
         want = _load_filtered(args, include_fails=False)
@@ -125,9 +127,14 @@ def cmd_verdicts(args):
     df = compute_and_write_verdicts(args)
 
     print(f"\n{'='*70}\nVerdicts: {args.model}   (n={len(df)})\n{'='*70}")
-    print("Deterministic symbolic checking supplies the primary label. Uncheckable rows "
-          "remain unresolved\nunless supplied through --adjudications; RMSLE and the stored "
-          "LLM judge are diagnostics only.")
+    if args.independent_judge:
+        print("Deterministic symbolic checking supplies the primary label. When it returns "
+              f"not_checkable, the explicitly selected independent judge "
+              f"({args.independent_judge}) supplies the fallback label. RMSLE remains diagnostic.")
+    else:
+        print("Deterministic symbolic checking supplies the primary label. Uncheckable rows "
+              "remain unresolved\nunless supplied through --adjudications; RMSLE and the stored "
+              "LLM judge are diagnostics only.")
 
     print("\n=== Agreement bucket counts ===")
     print(df["agreement_bucket"].value_counts().to_string())
@@ -252,7 +259,8 @@ def cmd_mistakes(args):
     failed = df["verified_success"].fillna(False).eq(False)  # noqa: E712
     fails = df[resolved & failed].copy()
     if fails.empty:
-        raise SystemExit("No resolved symbolic failures -- nothing to classify.")
+        print("No resolved failures -- nothing to classify.")
+        return
 
     # classify once per unique (submitted, ground_truth) pair, each call time-limited
     # (mismatch_classifier's sp.simplify can hang on nested exp/log/power forms).
@@ -683,6 +691,10 @@ def main():
         p.add_argument("--adjudications", default=None,
                        help="CSV with path,adjudicated_success and optional adjudicator/notes. "
                             "Use for human or independent locally-hosted-judge labels.")
+        p.add_argument("--independent-judge", default=None,
+                       help="explicitly use this recorded independent judge only when the "
+                            "deterministic checker returns not_checkable; every trial must name "
+                            "that judge and self-judging is refused")
         p.add_argument("--top", type=int, default=15)
         if name in ("mistakes", "all"):
             p.add_argument("--samples", type=int, default=8)
