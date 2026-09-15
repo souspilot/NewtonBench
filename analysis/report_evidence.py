@@ -25,6 +25,12 @@ FORMAT_MARKERS = (
 RUN_EXPERIMENT_RE = re.compile(
     r"<run_experiment>\s*(.*?)\s*</run_experiment>", re.DOTALL
 )
+ACTION_BLOCKS = {
+    "experiment": re.compile(r"<run_experiment>.*?</run_experiment>", re.DOTALL),
+    "python": re.compile(r"<python>.*?</python>", re.DOTALL),
+    "final_law": re.compile(r"<final_law>.*?</final_law>", re.DOTALL),
+}
+MAIN_RESPONSE_BOUNDARY = "\n\n**Main Response:**\n"
 BUDGET_DIR_RE = re.compile(r"budget_evaluation_results_(\d+)_cap")
 
 
@@ -110,8 +116,23 @@ def preceding_assistant(history, user_index):
     return ""
 
 
+def split_saved_channels(content):
+    """Recover the harness-combined reasoning/content fields when present.
+
+    The harness prefixes separated reasoning with ``**Reasoning Process:**``
+    and inserts the final ``**Main Response:**`` boundary itself.  ``rsplit``
+    is deliberate because some models repeat the same heading in reasoning.
+    """
+    content = content or ""
+    if content.startswith("**Reasoning Process:**") and MAIN_RESPONSE_BOUNDARY in content:
+        reasoning, main = content.rsplit(MAIN_RESPONSE_BOUNDARY, 1)
+        return reasoning.removeprefix("**Reasoning Process:**\n"), main
+    return "", content
+
+
 def command_format_examples(records):
     counts = defaultdict(lambda: {"trials": set(), "events": Counter()})
+    channel_counts = defaultdict(Counter)
     examples = {}
     no_law_examples = {}
 
@@ -119,6 +140,23 @@ def command_format_examples(records):
         key = (record["model"], record["condition"])
         counts[key]["trials"].add(record["path"])
         history = record["data"].get("chat_history", []) or []
+        for message in history:
+            if message.get("role") != "assistant":
+                continue
+            reasoning, main = split_saved_channels(message.get("content", "") or "")
+            if not reasoning:
+                continue
+            stranded_any = False
+            for action, pattern in ACTION_BLOCKS.items():
+                in_reasoning = len(pattern.findall(reasoning))
+                in_main = len(pattern.findall(main))
+                if in_reasoning and not in_main:
+                    channel_counts[key][action] += in_reasoning
+                    stranded_any = True
+            if stranded_any:
+                channel_counts[key]["turns"] += 1
+                channel_counts[key]["trial::" + record["path"]] = 1
+
         for index, message in enumerate(history):
             if message.get("role") != "user":
                 continue
@@ -165,6 +203,17 @@ def command_format_examples(records):
             f"{model},{condition},{len(entry['trials'])},{affected},{events['any']},"
             f"{events['Invalid response']},{events['Action Reminder']},"
             f"{events['exactly 1 action per turn']}"
+        )
+
+    print("\n# Complete action blocks stranded in separated reasoning")
+    print("model,condition,affected_trials,assistant_turns,experiment_blocks,python_blocks,final_law_blocks")
+    for key in sorted(counts, key=lambda item: (item[0], condition_key(item[1]))):
+        model, condition = key
+        entry = channel_counts[key]
+        affected = sum(name.startswith("trial::") for name in entry)
+        print(
+            f"{model},{condition},{affected},{entry['turns']},{entry['experiment']},"
+            f"{entry['python']},{entry['final_law']}"
         )
 
     print("\n# Exact format-failure examples")
