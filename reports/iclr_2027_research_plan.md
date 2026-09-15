@@ -103,7 +103,7 @@ The novelty is not “budget awareness.” Budget-aware web and tool agents alre
 
 **H5.1:** Invalid actions and missing final laws account for a meaningful, model-dependent fraction of failures.  
 **H5.2:** After controlling for task identity and difficulty, genuine model protocol failures still predict lower recovery.
-**Current evidence:** an initial upper-bound audit finds reasoning-only action blocks in 29.2–54.9% of trials per model-condition, and exact examples confirm genuine rejected actions. A conservative count requiring no valid main action and exactly one valid reasoning action is pending. This is primarily a harness-validity issue; genuine malformed actions must be measured separately after repair.
+**Current evidence:** under a conservative definition, recoverable reasoning-only actions occur in 31.2–39.6% of Muse trials and 20.1–52.1% of Qwen38 trials per condition. Rejection feedback immediately follows 55.0–69.4% of these Muse turns and 98.2–100% of Qwen38 turns. This is primarily a harness-validity issue; genuine malformed actions must be measured separately after repair.
 
 ## 4. Mandatory workstream A: freeze reliable trajectories and outcomes
 
@@ -111,9 +111,9 @@ This must finish before any new headline analysis.
 
 ### A0. Repair action-channel handling and rerun the pilot
 
-The current trajectories are not yet publication-ready. The vLLM endpoint separates `reasoning` and `content`, while the agents generally execute only actions found in `content`. The initial 29.2–54.9% range is an upper bound; exact examples nevertheless confirm that valid experiment and Python actions can be lost, changing later evidence in a way rejudging cannot repair. Complete the conservative channel audit first, then determine the replacement-run scope.
+The current trajectories are not publication-ready. The vLLM endpoint separates `reasoning` and `content`, while the agents generally execute only actions found in `content`. A conservative audit finds affected trials in every model-condition cell, including large and strongly condition-dependent rates for Qwen38. Valid experiment and Python actions are lost, changing later evidence in a way rejudging cannot repair. The complete model × resource matrix must be rerun after repair.
 
-Implement and test one explicit policy: if main content contains no action and reasoning contains exactly one complete, valid allowed action, execute that action; otherwise preserve the existing rejection behavior. Store raw reasoning and content separately and record which field supplied each executed action. Add adversarial tests for all three action types, malformed blocks, and conflicting/multiple actions. Then rerun the complete model × resource matrix, including the unbudgeted baseline. Preserve the current trees as a named flawed-pilot artifact rather than overwriting them.
+Implement and test one explicit policy: if main content contains no action and reasoning contains exactly one complete, valid allowed action, execute that action; otherwise preserve the existing rejection behavior. Store raw reasoning and content separately and record which field supplied each executed action. Add adversarial tests for all three action types, malformed blocks, and conflicting/multiple actions. Then rerun the complete model × resource matrix, including the unbudgeted baseline. Do not rerun only the previously affected subset: evaluation generation uses temperature 0.4, so selecting replacement trials based on the old trajectories would create a post-hoc mixed sample. Preserve the current trees as a named flawed-pilot artifact rather than overwriting them.
 
 ### A1. Establish two named recovery metrics
 
