@@ -9,6 +9,7 @@ match the completed diagnostics run.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import re
@@ -26,9 +27,9 @@ RUN_EXPERIMENT_RE = re.compile(
     r"<run_experiment>\s*(.*?)\s*</run_experiment>", re.DOTALL
 )
 ACTION_BLOCKS = {
-    "experiment": re.compile(r"<run_experiment>.*?</run_experiment>", re.DOTALL),
-    "python": re.compile(r"<python>.*?</python>", re.DOTALL),
-    "final_law": re.compile(r"<final_law>.*?</final_law>", re.DOTALL),
+    "experiment": re.compile(r"<run_experiment>\s*(.*?)\s*</run_experiment>", re.DOTALL),
+    "python": re.compile(r"<python>\s*(.*?)\s*</python>", re.DOTALL),
+    "final_law": re.compile(r"<final_law>\s*(.*?)\s*</final_law>", re.DOTALL),
 }
 MAIN_RESPONSE_BOUNDARY = "\n\n**Main Response:**\n"
 BUDGET_DIR_RE = re.compile(r"budget_evaluation_results_(\d+)_cap")
@@ -130,6 +131,46 @@ def split_saved_channels(content):
     return "", content
 
 
+def valid_action_counts(text):
+    """Count syntactically valid action blocks of each allowed type."""
+    counts = Counter()
+    for payload in ACTION_BLOCKS["experiment"].findall(text or ""):
+        try:
+            experiments = json.loads(payload)
+            if isinstance(experiments, (list, dict)):
+                counts["experiment"] += 1
+        except json.JSONDecodeError:
+            pass
+    for payload in ACTION_BLOCKS["python"].findall(text or ""):
+        try:
+            compile(payload, "<assistant-python-action>", "exec")
+            counts["python"] += 1
+        except (SyntaxError, ValueError, TypeError):
+            pass
+    for payload in ACTION_BLOCKS["final_law"].findall(text or ""):
+        try:
+            tree = ast.parse(payload)
+            if any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "discovered_law"
+                for node in tree.body
+            ):
+                counts["final_law"] += 1
+        except (SyntaxError, ValueError, TypeError):
+            pass
+    return counts
+
+
+def next_user_feedback(history, start):
+    for message in history[start + 1 :]:
+        if message.get("role") == "user":
+            content = message.get("content", "") or ""
+            return any(marker in content for marker in FORMAT_MARKERS)
+        if message.get("role") == "assistant":
+            return False
+    return False
+
+
 def command_format_examples(records):
     counts = defaultdict(lambda: {"trials": set(), "events": Counter()})
     channel_counts = defaultdict(Counter)
@@ -140,22 +181,23 @@ def command_format_examples(records):
         key = (record["model"], record["condition"])
         counts[key]["trials"].add(record["path"])
         history = record["data"].get("chat_history", []) or []
-        for message in history:
+        for index, message in enumerate(history):
             if message.get("role") != "assistant":
                 continue
             reasoning, main = split_saved_channels(message.get("content", "") or "")
             if not reasoning:
                 continue
-            stranded_any = False
-            for action, pattern in ACTION_BLOCKS.items():
-                in_reasoning = len(pattern.findall(reasoning))
-                in_main = len(pattern.findall(main))
-                if in_reasoning and not in_main:
-                    channel_counts[key][action] += in_reasoning
-                    stranded_any = True
-            if stranded_any:
+            reasoning_actions = valid_action_counts(reasoning)
+            main_actions = valid_action_counts(main)
+            # Conservative recoverability criterion: no valid action in main
+            # and exactly one valid allowed action in reasoning.
+            if sum(main_actions.values()) == 0 and sum(reasoning_actions.values()) == 1:
+                action = next(iter(reasoning_actions.elements()))
+                channel_counts[key][action] += 1
                 channel_counts[key]["turns"] += 1
                 channel_counts[key]["trial::" + record["path"]] = 1
+                if next_user_feedback(history, index):
+                    channel_counts[key]["feedback_confirmed"] += 1
 
         for index, message in enumerate(history):
             if message.get("role") != "user":
@@ -205,14 +247,15 @@ def command_format_examples(records):
             f"{events['exactly 1 action per turn']}"
         )
 
-    print("\n# Complete action blocks stranded in separated reasoning")
-    print("model,condition,affected_trials,assistant_turns,experiment_blocks,python_blocks,final_law_blocks")
+    print("\n# Single valid actions recoverable from separated reasoning")
+    print("model,condition,affected_trials,assistant_turns,feedback_confirmed_turns,experiment_blocks,python_blocks,final_law_blocks")
     for key in sorted(counts, key=lambda item: (item[0], condition_key(item[1]))):
         model, condition = key
         entry = channel_counts[key]
         affected = sum(name.startswith("trial::") for name in entry)
         print(
-            f"{model},{condition},{affected},{entry['turns']},{entry['experiment']},"
+            f"{model},{condition},{affected},{entry['turns']},{entry['feedback_confirmed']},"
+            f"{entry['experiment']},"
             f"{entry['python']},{entry['final_law']}"
         )
 

@@ -6,9 +6,12 @@
 **Models:** `muse-glimmer-30b`, `qwen38-27b`  
 **Scoring:** independent `gemma4-31b` rejudge followed by a deterministic-first scoring cascade  
 **Coverage:** 3,455 of 3,456 planned trajectories; Muse at \$1,000 has 287 rather than 288 trials  
+**Pilot validity:** scoring is reliable for the stored submissions, but exact examples confirm an action-channel handling bug; its conservative prevalence is being audited before the trajectories can be treated as paper-facing results
 **Primary run record:** [`full_diagnostics.log`](/Users/harshitbisht/full_diagnostics.log)
 
 This report describes a pilot. It reports observed differences and measurement limitations; it does not claim that the present cost schedule is optimal, realistic, or sufficient to isolate causal mechanisms.
+
+> **Measurement warning.** The first channel audit finds candidate reasoning-only action blocks in 29.2–54.9% of trials per model-condition, and exact examples confirm that some valid actions were rejected. Those percentages are upper bounds because the first extractor did not exclude turns containing a different valid main-response action. A stricter audit is required. Rejudging can correct labels for stored laws, but it cannot reconstruct a trajectory when an experiment or Python action was genuinely lost.
 
 ## 1. Study at a glance
 
@@ -41,11 +44,11 @@ Unaffordable requests are rejected without charge. Two consecutive rejections en
 
 | Observation | Evidence | Scope of interpretation |
 |---|---:|---|
-| Accuracy falls as the assigned grant tightens | Muse: 67.7% unbudgeted → 22.2% at \$200; Qwen38: 88.2% → 36.8% | Causal for the bundled budget intervention, not for spending alone |
+| Recorded accuracy falls as the assigned grant tightens | Muse: 67.7% unbudgeted → 22.2% at \$200; Qwen38: 88.2% → 36.8% | Provisional: action-channel failure rates differ across conditions |
 | The largest measured step is \$400 → \$200 | Muse: −20.5 pp; Qwen38: −33.0 pp | A property of this price schedule and task subset |
 | Difficulty strongly moderates the budget effect | At \$200, easy/medium/hard SA is 56.9/16.0/0.0% for Muse and 66.7/38.9/2.8% for Qwen38 | Difficulty bins pool different modules |
 | Agent interface matters | Muse vanilla exceeds code-assisted at every condition; Qwen38 differences are small and inconsistent | An interaction, not evidence that tools are generally harmful |
-| Rejected-action feedback is common | Depending on the model-condition cell, 27.4–55.9% of trials receive at least one `Invalid response` or `Action Reminder` | The extracted examples show a model–reasoning-parser interaction, not just malformed model output |
+| Candidate reasoning-channel action loss is common | Depending on the model-condition cell, the initial upper bound is 29.2–54.9% of trials | Exact examples confirm the bug; conservative prevalence is pending |
 | Scoring still needs an audit | 125 of 3,455 trials have a judge/checker conflict | The score is usable for the pilot but not yet frozen for publication |
 
 ## 2. What a trial measures
@@ -137,6 +140,8 @@ RMSLE remains a diagnostic measure, not the primary decision rule. Completed tra
 The 125 conflicts comprise 124 cases where Gemma passes a SymPy mismatch and one Qwen38 \$400 case where SymPy passes but Gemma fails. This audit matters because some submissions are close numerical approximations rather than exact identities. Until a tolerance-aware policy is fixed, the independent-judge and deterministic-primary columns below are best read as two documented views of the same pilot.
 
 ## 4. Results
+
+All tables in this section accurately summarize the completed run, but they are **provisional debugging results** until conservative action-channel counts are available. The tables should not yet be used as final estimates of model ability or budget effects.
 
 ### 4.1 Accuracy by assigned grant
 
@@ -272,13 +277,32 @@ The diagnostic marks a trial when a user/tool feedback message contains `Invalid
 
 The extracted histories expose a concrete interface failure. The vLLM response separates `reasoning` from `content`; the harness records them together for diagnostics but executes only the main `content` response. In the examples below, the model placed a syntactically valid action in `reasoning`, while `content` was empty or only repeated `**Main Response:**`. The action was therefore visible in the saved history but invisible to the action handler.
 
+| Model | Condition | Candidate trials with ≥1 reasoning-only action | Candidate assistant turns | Experiment blocks | Python blocks | Final-law blocks |
+|---|---:|---:|---:|---:|---:|---:|
+| Muse | Unbudgeted | 101/288 (35.1%) | 120 | 66 | 37 | 20 |
+| Muse | \$1,000 | 123/287 (42.9%) | 148 | 102 | 45 | 21 |
+| Muse | \$800 | 124/288 (43.1%) | 155 | 86 | 63 | 32 |
+| Muse | \$600 | 119/288 (41.3%) | 158 | 136 | 39 | 44 |
+| Muse | \$400 | 100/288 (34.7%) | 132 | 77 | 44 | 30 |
+| Muse | \$200 | 125/288 (43.4%) | 174 | 118 | 54 | 56 |
+| Qwen38 | Unbudgeted | 84/288 (29.2%) | 138 | 90 | 37 | 19 |
+| Qwen38 | \$1,000 | 157/288 (54.5%) | 275 | 170 | 98 | 88 |
+| Qwen38 | \$800 | 158/288 (54.9%) | 299 | 164 | 171 | 33 |
+| Qwen38 | \$600 | 136/288 (47.2%) | 246 | 132 | 102 | 43 |
+| Qwen38 | \$400 | 139/288 (48.3%) | 232 | 112 | 84 | 53 |
+| Qwen38 | \$200 | 111/288 (38.5%) | 169 | 142 | 160 | 65 |
+
+These are upper-bound candidate counts. The first extractor counted a reasoning-field action whenever main content lacked the *same action type*; a turn with a reasoning experiment and a different valid main action could therefore be included. The block columns can also overlap within a turn. Qwen38's candidate rate is 29.2% unbudgeted but 47.2–54.9% at grants from \$600 to \$1,000, so genuine channel loss could confound part of its measured gap, but the table does not yet quantify how much.
+
 | Trial | Saved assistant-history excerpt | Harness feedback | What happened |
 |---|---|---|---|
 | Muse code, gravity, unbudgeted, `.../medium/v0/.../trial2.json` | `<run_experiment>[{"mass1": 1, ...}, {"mass1": 1, ...}]</run_experiment>` followed by an empty second main-response section | `Action Reminder: ... exactly 1 action per turn` | A valid experiment block was stranded in the reasoning channel |
 | Muse vanilla, gravity, unbudgeted, `.../medium/v0/.../trial0.json` | `<run_experiment>[five valid JSON objects]</run_experiment>` followed by an empty main response | `Invalid response` | The experiment request was present in saved reasoning but absent from parsed content |
 | Qwen38 code, gravity, unbudgeted, `.../medium/v0/.../trial2.json` | `<python> ... fit log acceleration against log distance ... </python>` followed by an empty main response | `Action Reminder: ... exactly 1 action per turn` | A valid analysis action was stranded in the reasoning channel |
 
-Separately, the budgeted histories contain 103–152 unparseable Muse experiment blocks and 214–240 unparseable Qwen38 blocks per grant condition. Thus both mechanisms exist: some action blocks are malformed, while other apparently valid actions are lost at the reasoning/content boundary. The present aggregate success comparisons include both effects. Their separate prevalence has not yet been computed, so this report does not attribute the accuracy gap to either mechanism.
+Separately, the budgeted histories contain 103–152 unparseable Muse experiment blocks and 214–240 unparseable Qwen38 blocks per grant condition. Thus both mechanisms exist: some action blocks are malformed, while complete actions are also lost at the reasoning/content boundary. The two counts can overlap and should not be added.
+
+The revised audit uses the conservative rule proposed for a repair: main content contains no syntactically valid action and reasoning contains exactly one syntactically valid allowed action. It also counts how often such a turn is immediately followed by rejection feedback. If those refined counts are non-trivial, the runner should preserve raw `reasoning` and `content` separately, implement and test this rule for experiment, Python, and final-law actions, and rerun the full model × grant matrix including the unbudgeted baseline. Rejudge, scoreboard, or diagnostics alone cannot repair affected trajectories.
 
 ### 5.2 Final-law visibility and placeholder submissions
 
@@ -330,11 +354,11 @@ The bins are unequal because spending takes repeated discrete values. Quantile b
 
 These tables are descriptive. Realized spending is chosen by the agent after seeing the task and observations: easy trials may stop cheaply, difficult trials may spend more and still fail, and two equal-cost campaigns may buy differently informative experiments. The assigned-grant table in Section 4.1 is the appropriate starting point for studying the budget intervention; the realized-spend table cannot estimate the causal benefit of spending another dollar.
 
-## 6. What the pilot does and does not establish
+## 6. What the pilot currently establishes
 
-| Supported observation | Important limitation |
+| Observation in the recorded runs | Important limitation |
 |---|---|
-| Both models are less accurate under tighter hard grants | Budget changes affordability, precision, feedback, and stopping together |
+| Both models score lower under tighter hard grants | Differential action-channel loss prevents a clean estimate of the intended budget effect |
 | The \$200 condition is much worse than \$400 | The numerical threshold is specific to this synthetic price schedule |
 | Hard tasks degrade more sharply than easy tasks | Difficulty bins contain different laws and system types |
 | Muse vanilla exceeds Muse code-assisted | The result may depend on these prompts and implementations |
@@ -342,7 +366,7 @@ These tables are descriptive. Realized spending is chosen by the agent after see
 | Rejected-action feedback correlates with lower SA in most cells | Some apparently valid actions are stranded by reasoning/content separation; the association is not adjusted for task difficulty or trajectory length |
 | Qwen38 obtains higher SA with fewer mean observations | Observation count alone does not measure information quality or cost efficiency |
 
-The pilot does **not yet** show that either agent uses feedback adaptively, that either policy is close to optimal, that the price schedule represents a real laboratory, or that the findings generalize beyond the two evaluated models. Those questions require new controls rather than stronger interpretation of the current tables.
+The pilot validates the result-processing and scoring workflow and identifies useful behavioral measurements. It does **not yet** provide publication-ready accuracy curves. After the action-channel repair and rerun, further controls are still needed to show adaptive feedback use, policy quality, cost-schedule robustness, or generalization beyond the two evaluated models.
 
 ## 7. Research context
 

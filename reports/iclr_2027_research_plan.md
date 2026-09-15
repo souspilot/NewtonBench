@@ -102,12 +102,18 @@ The novelty is not “budget awareness.” Budget-aware web and tool agents alre
 ### RQ5: Which failures are scientific and which are operational?
 
 **H5.1:** Invalid actions and missing final laws account for a meaningful, model-dependent fraction of failures.  
-**H5.2:** After controlling for task identity and difficulty, format failures still predict lower recovery.  
-**Current evidence:** strong unadjusted associations, but no matched or multilevel estimate.
+**H5.2:** After controlling for task identity and difficulty, genuine model protocol failures still predict lower recovery.
+**Current evidence:** an initial upper-bound audit finds reasoning-only action blocks in 29.2–54.9% of trials per model-condition, and exact examples confirm genuine rejected actions. A conservative count requiring no valid main action and exactly one valid reasoning action is pending. This is primarily a harness-validity issue; genuine malformed actions must be measured separately after repair.
 
-## 4. Mandatory workstream A: freeze reliable outcomes
+## 4. Mandatory workstream A: freeze reliable trajectories and outcomes
 
 This must finish before any new headline analysis.
+
+### A0. Repair action-channel handling and rerun the pilot
+
+The current trajectories are not yet publication-ready. The vLLM endpoint separates `reasoning` and `content`, while the agents generally execute only actions found in `content`. The initial 29.2–54.9% range is an upper bound; exact examples nevertheless confirm that valid experiment and Python actions can be lost, changing later evidence in a way rejudging cannot repair. Complete the conservative channel audit first, then determine the replacement-run scope.
+
+Implement and test one explicit policy: if main content contains no action and reasoning contains exactly one complete, valid allowed action, execute that action; otherwise preserve the existing rejection behavior. Store raw reasoning and content separately and record which field supplied each executed action. Add adversarial tests for all three action types, malformed blocks, and conflicting/multiple actions. Then rerun the complete model × resource matrix, including the unbudgeted baseline. Preserve the current trees as a named flawed-pilot artifact rather than overwriting them.
 
 ### A1. Establish two named recovery metrics
 
@@ -154,7 +160,7 @@ The two-A100 limit is compatible with this protocol. No publication label should
 
 High-value extensions are AST normalization, safe evaluation on randomized domain-valid points, analytic fitting of one nuisance scale, and explicit exponent tolerance. Do not attempt an ambitious theorem prover during the deadline window. Every checker rule needs adversarial unit tests that include near-fit structural errors.
 
-**Exit criterion:** ESR and TSR labels are frozen; a rerun produces identical scoreboards; no unresolved publication labels remain; the audit sheet and configuration hashes are archived.
+**Exit criterion:** the action-channel tests pass; replacement trajectories contain no unhandled single valid actions; ESR and TSR labels are frozen; a scoring rerun produces identical scoreboards; no unresolved publication labels remain; the audit sheet and configuration hashes are archived.
 
 ## 5. Mandatory workstream B: isolate the intervention
 
@@ -387,13 +393,16 @@ The official ICLR calendar is tighter than “two weeks.” A genuine abstract m
 
 ### 15 September
 
+- Repair and test reasoning/content action handling.
+- Launch replacement unbudgeted and hard-grant pilot runs; do not overwrite the flawed pilot.
 - Freeze the thesis, research questions, and primary metrics.
-- Begin all 125 disagreement adjudications.
 - Generate paired manifests and cluster-bootstrap code.
 - Register paper title, authors, and a genuine abstract draft internally.
 
 ### 16 September
 
+- Complete the replacement pilot and rerun rejudge, diagnostics, and scoreboards.
+- Regenerate the disagreement set; do not assume the current 125 cases persist.
 - Complete ESR/TSR scoring and judge-validation sample.
 - Implement rounded-only and sham-budget controls.
 - Implement random/space-filling and candidate-disagreement baselines.
